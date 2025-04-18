@@ -1,0 +1,40 @@
+[package]
+name = "pio_sdio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+embassy-executor = { version = "0.7", default-features = false, features = [
+  "arch-cortex-m",
+  "executor-thread",
+  "nightly",
+  "defmt",
+] }
+embassy-time = { version = "0.4.0", default-features = false, features = [
+  "defmt",
+  "defmt-timestamp-uptime",
+] }
+embassy-rp = { version = "0.4.0", features = [
+  "defmt",
+  "critical-section-impl",
+  "time-driver",
+  "intrinsics",
+  "rp2040",
+] }
+embassy-futures = "0.1.1"
+embassy-sync = { version = "0.6", features = ["defmt"] }
+
+embedded-hal = "1.0"
+futures = { version = "0.3", default-features = false, features = [
+  "async-await",
+] }
+defmt = "0.3"
+defmt-rtt = "0.4.0"
+cortex-m = { version = "0.7.7" }
+cortex-m-rt = "0.7.0"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+embedded-sdmmc = { version = "0.8.1", default-features = false, features = [
+  "defmt-log",
+] }
+embedded-hal-bus = "0.3.0"
+rand = { version = "0.8.5", default-features = false }
