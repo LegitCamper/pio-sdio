@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
+use defmt::assert;
 use defmt::{info, unwrap, warn};
 use embassy_executor::Spawner;
 use embassy_rp::Peripheral;
@@ -33,8 +34,8 @@ async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     let Pio {
         mut common,
-        mut sm0,
-        mut sm1,
+        sm0,
+        sm1,
         ..
     } = Pio::new(p.PIO0, Irqs);
 
@@ -53,8 +54,22 @@ async fn main(_spawner: Spawner) {
     info!("Done!!!");
 
     loop {
-        Timer::after_millis(1).await;
-        sdio.cmd_sm.tx().push(200);
+        // info!("Y: {}", unsafe { sdio.cmd_sm.get_y() },);
+        sdio.write_cmd(&[10, 10], 136);
+        for _ in 0..100 {
+            let x = unsafe { sdio.cmd_sm.get_x() };
+            if x > 48 {
+                info!(
+                    "X: {}, x: threshold: {}, Y: {}",
+                    x,
+                    sdio.cmd_sm.get_tx_threshold(),
+                    unsafe { sdio.cmd_sm.get_y() },
+                );
+                Timer::after_micros(100).await;
+            }
+        }
+
+        Timer::after_millis(10).await;
     }
 }
 
@@ -67,29 +82,26 @@ impl<'d, PIO: Instance> PioSdioPrograms<'d, PIO> {
     pub fn new(pio: &mut Common<'d, PIO>) -> Self {
         let clk = pio_asm!(".side_set 1", "irq 0 side 0", "irq clear 0 side 1");
 
-        // Ensure when writing to TX you write the 48 bit CMD bytes
-        // followed by the length of the CMD read (eg. 48 or 136)
+        // the upper half of the second word sent needs to contain the length of the response
         let cmd = pio_asm!(
-            ".side_set 1 opt pindirs"
-            "pull", // Get write counter
+            ".side_set 1 opt pindirs",
+            "pull",       // Manually pull write counter
             "mov y, osr", // y = 48
-
-            // Write CMD
             ".wrap_target",
-            "mov x, y          side 1", // (re)set counter
-            // "set pindirs 1",
-            "wait 0 irq 0", // wait for clk
+            // Write CMD
+            "mov x, y          side 1", // (re)set counter, set cmd as output
+            "wait 0 irq 0",             // wait for clk low
             "lp_write:",
-            "out pins, 1",
+            "out pins, 1", // pulls 1 bit from OSR, triggers autopull if < 16 bits
             "jmp x-- lp_write",
-
             // Read CMD
-            "mov x, osr        side 0", // y = 48 or 136
-            // "set pindirs 0",
-            "wait 0 irq 0", // wait for clk
-            "lp_read:",
-            "in pins, 1",
-            "jmp x-- lp_read"
+             "pull",                     // shift counter down 16 bits, bc its packed into upper cmd
+             "out x, 16         side 0", // x = 48 or 136, set cmd as input
+             "wait 0 irq 0",             // wait for clk low
+             "lp_read:",
+             "in pins, 1",
+             "jmp x-- lp_read",
+             "pull block"
             ".wrap",
         );
 
@@ -133,8 +145,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize> PioSdio<'d, PIO, SM0
         // Cmd program config
         let cmd = pio.make_pio_pin(cmd_pin);
         let mut cfg = pio::Config::default();
-        cfg.use_program(&programs.cmd, &[]);
-        cfg.set_set_pins(&[&cmd]);
+        cfg.use_program(&programs.cmd, &[&cmd]);
         cfg.set_out_pins(&[&cmd]);
         cfg.set_in_pins(&[&cmd]);
         cfg.clock_divider = div.into();
@@ -143,10 +154,16 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize> PioSdio<'d, PIO, SM0
         shift_cfg.threshold = 32;
         shift_cfg.direction = ShiftDirection::Left;
         shift_cfg.auto_fill = true;
-        cfg.shift_in = shift_cfg;
         cfg.shift_out = shift_cfg;
 
+        let mut shift_cfg = ShiftConfig::default();
+        shift_cfg.threshold = 32;
+        shift_cfg.direction = ShiftDirection::Left;
+        shift_cfg.auto_fill = true;
+        cfg.shift_in = shift_cfg;
+
         cmd_sm.set_config(&cfg);
+        cmd_sm.tx().push(48); // The counter for cmd write is 48
         cmd_sm.set_enable(true);
 
         Self {
@@ -165,58 +182,13 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize> PioSdio<'d, PIO, SM0
         self.cmd_sm.tx().push(48);
     }
 
-    fn write_byte(&mut self, byte: u8) {
-        while self.clk_sm.tx().full() {}
-        self.clk_sm.tx().push((byte as u32) << 24);
-        // info!("Write {:x}", byte);
-    }
+    fn write_cmd(&mut self, cmd: &[u32], response_len: u16) {
+        assert!(cmd.len() == 2);
 
-    fn read_byte(&mut self) -> u8 {
-        while self.clk_sm.rx().empty() {}
-        let read = self.clk_sm.rx().pull();
-        let byte = (read & 0xFF) as u8;
-        // info!("Read byte: {:02X}", byte);
-        byte
+        // write 2 cmd words
+        self.cmd_sm.tx().push(cmd[0]); // first 32 bits of cmd
+        self.cmd_sm
+            .tx()
+            .push(((response_len as u32) << 16) | cmd[1]); // last 16 bits of cmd + response len
     }
 }
-
-// impl<'a, PIO: Instance, const SM: usize> SdioBus<u8> for PioSdio<'a, PIO, SM> {
-//     fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-//         for word in words.iter_mut() {
-//             self.write_byte(0xFF);
-//             *word = self.read_byte() as u8;
-//         }
-//         Ok(())
-//     }
-
-//     fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-//         for &byte in words {
-//             self.write_byte(byte);
-//         }
-
-//         self.flush()
-//     }
-
-//     fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
-//         for (r, &w) in read.iter_mut().zip(write.iter()) {
-//             self.write_byte(w);
-//             *r = self.read_byte();
-//         }
-
-//         self.flush()
-//     }
-
-//     fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-//         for word in words.iter_mut() {
-//             self.write_byte(*word);
-//             *word = self.read_byte();
-//         }
-
-//         self.flush()
-//     }
-
-//     fn flush(&mut self) -> Result<(), Self::Error> {
-//         while !self.sm.tx().empty() {}
-//         Ok(())
-//     }
-// }
