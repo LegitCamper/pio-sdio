@@ -7,7 +7,7 @@ use defmt::{info, unwrap, warn};
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::clk_sys_freq;
-use embassy_rp::dma::Channel;
+use embassy_rp::dma::{Channel, Transfer};
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
@@ -92,27 +92,26 @@ impl<'d, PIO: Instance> PioSdioPrograms<'d, PIO> {
             ".wrap",
         );
 
+        // the first word pushed before any data must be the length of the data
         // when not writing, pin direction is set as input and the write flag is cleared allowing reads to occur
         let oneb_tx = pio_asm!(
             ".side_set 1 opt pindirs",
-            "set y, 31",
             ".wrap_target",
-            "mov x, y",              // (re)set counter
-            "pull block",            // Wait for data in tx
+            "pull block",            // wait for data
+            "out y, 32",             // set y to counter
             "irq 1          side 1", // raise write, set d0 as output
             "wait 0 irq 0",
-            "lp:", // write word in osr
+            "lp:", // write word from osr
             "out pins, 1",
-            "jmp x-- lp",
+            "jmp y-- lp",
             "irq clear 1    side 0", // clear write, set d0 back as input
             ".wrap",
         );
 
+        // before data can be read, the length of data needs to be set
         // pin direction and read/write irqs are managed by oneb_tx
         let oneb_rx = pio_asm!(
-            "set y, 31",
             ".wrap_target",
-            "mov x, y",     // (re)set counter
             "wait 1 irq 0", // wait for not writing
             "wait 0 irq 0",
             "lp:", // read word into isr
@@ -267,12 +266,17 @@ impl<
     }
 
     /// Return an in-prograss dma transfer future. Awaiting it will guarantee a complete transfer.
-    fn write(&mut self, buff: &[u32]) {
-        self.tx_sm.tx().dma_push(self.dma.reborrow(), buff, false);
+    fn write<'b>(&'b mut self, buff: &'b [u32], len: u32) -> Transfer<'b, C> {
+        self.tx_sm.tx().push(len);
+        self.tx_sm.tx().dma_push(self.dma.reborrow(), buff, false)
     }
 
     /// Return an in-prograss dma transfer future. Awaiting it will guarantee a complete transfer.
-    fn read(&mut self, buff: &mut [u32]) {
-        self.rx_sm.rx().dma_pull(self.dma.reborrow(), buff, false);
+    fn read<'b>(&'b mut self, buff: &'b mut [u32], len: u32) -> Transfer<'b, C> {
+        // Because the fifos are tied, there is no other way to set counter
+        unsafe {
+            self.rx_sm.set_x(len);
+        }
+        self.rx_sm.rx().dma_pull(self.dma.reborrow(), buff, false)
     }
 }
