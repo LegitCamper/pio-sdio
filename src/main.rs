@@ -53,21 +53,13 @@ async fn main(_spawner: Spawner) {
 
     info!("Done!!!");
 
+    info!("Y: {}", unsafe { sdio.cmd_sm.get_y() },);
     loop {
-        // info!("Y: {}", unsafe { sdio.cmd_sm.get_y() },);
-        sdio.write_cmd(&[10, 10], 136);
-        for _ in 0..100 {
-            let x = unsafe { sdio.cmd_sm.get_x() };
-            if x > 48 {
-                info!(
-                    "X: {}, x: threshold: {}, Y: {}",
-                    x,
-                    sdio.cmd_sm.get_tx_threshold(),
-                    unsafe { sdio.cmd_sm.get_y() },
-                );
-                Timer::after_micros(100).await;
-            }
+        if sdio.cmd_sm.tx().empty() {
+            sdio.write_cmd(&[100, 100], 135);
         }
+        info!("Y: {}", unsafe { sdio.cmd_sm.get_y() },);
+        info!("X: {:#010X}", unsafe { sdio.cmd_sm.get_x() });
 
         Timer::after_millis(10).await;
     }
@@ -82,26 +74,24 @@ impl<'d, PIO: Instance> PioSdioPrograms<'d, PIO> {
     pub fn new(pio: &mut Common<'d, PIO>) -> Self {
         let clk = pio_asm!(".side_set 1", "irq 0 side 0", "irq clear 0 side 1");
 
-        // the upper half of the second word sent needs to contain the length of the response
+        // the lower half of the second word sent needs to contain the length of the response
         let cmd = pio_asm!(
             ".side_set 1 opt pindirs",
-            "pull",       // Manually pull write counter
-            "mov y, osr", // y = 48
+            "out y, 32", // Store 47 in y (for write loop)
             ".wrap_target",
             // Write CMD
             "mov x, y          side 1", // (re)set counter, set cmd as output
             "wait 0 irq 0",             // wait for clk low
             "lp_write:",
-            "out pins, 1", // pulls 1 bit from OSR, triggers autopull if < 16 bits
+            "out pins, 1",
             "jmp x-- lp_write",
             // Read CMD
-             "pull",                     // shift counter down 16 bits, bc its packed into upper cmd
-             "out x, 16         side 0", // x = 48 or 136, set cmd as input
-             "wait 0 irq 0",             // wait for clk low
-             "lp_read:",
-             "in pins, 1",
-             "jmp x-- lp_read",
-             "pull block"
+            "out x, 16        side 0", // move counter to x (47 or 135), set cmd as input
+            "wait 0 irq 0",            // wait for clk low
+            "lp_read:",
+            "in pins, 1",
+            "jmp x-- lp_read",
+            "push", // push remaining 16 bits from isr
             ".wrap",
         );
 
@@ -163,7 +153,8 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize> PioSdio<'d, PIO, SM0
         cfg.shift_in = shift_cfg;
 
         cmd_sm.set_config(&cfg);
-        cmd_sm.tx().push(48); // The counter for cmd write is 48
+        cmd_sm.clear_fifos();
+        cmd_sm.tx().push(47); // The counter for cmd write is 48
         cmd_sm.set_enable(true);
 
         Self {
@@ -179,16 +170,14 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize> PioSdio<'d, PIO, SM0
         self.config.clock_divider = ((clk_sys_freq() / freq) as u16).into();
         self.clk_sm.restart();
         self.cmd_sm.restart();
-        self.cmd_sm.tx().push(48);
+        self.cmd_sm.tx().push(47);
     }
 
-    fn write_cmd(&mut self, cmd: &[u32], response_len: u16) {
+    fn write_cmd(&mut self, cmd: &[u32], response_len: u32) {
         assert!(cmd.len() == 2);
 
         // write 2 cmd words
         self.cmd_sm.tx().push(cmd[0]); // first 32 bits of cmd
-        self.cmd_sm
-            .tx()
-            .push(((response_len as u32) << 16) | cmd[1]); // last 16 bits of cmd + response len
+        self.cmd_sm.tx().push(((cmd[1]) << 16) | response_len); // last 16 bits of cmd + response len
     }
 }
