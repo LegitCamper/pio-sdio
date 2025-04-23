@@ -11,7 +11,7 @@ use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
     self, Direction, FifoJoin, InterruptHandler, Pio, ShiftConfig, ShiftDirection, StateMachine,
 };
-use embassy_rp::{Peripheral, bind_interrupts};
+use embassy_rp::{Peripheral, bind_interrupts, into_ref};
 use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -134,9 +134,33 @@ async fn main(_spawner: Spawner) {
         (clk_sm, tx_sm, rx_sm)
     };
 
+    // let mut test_write: [u32; 7] = [10, 100, 1000, 10_000, 97, 88, 1001];
+    // let mut test_read = [0_u32; 1];
+
+    // tx.tx().push(test_write.len() as u32 * 31); // push len
+    // let dma_tx = tx.tx().dma_push(p.DMA_CH0.into_ref(), &test_write, false);
+
+    // let dma_rx = rx
+    //     .rx()
+    //     .dma_pull(p.DMA_CH1.into_ref(), &mut test_read, false);
+
+    // info!("Awaiting Data transfer");
+    // dma_tx.await;
+    // // dma_rx.await;
+    // info!("RX: {}", rx.rx().pull());
+
+    // for w in test_write {
+    //     tx.tx().push(w);
+    // }
+
+    // for w in test_read.iter_mut() {
+    //     *w = rx.rx().pull();
+    // }
+
+    // info!("RX: {}", test_read);
+
     loop {
-        // while tx.tx().full() {}
-        tx.tx().push(31); // push len
+        while tx.tx().full() {}
         tx.tx().push(0xBAAAAAAB);
         // while rx.rx().empty() {}
         info!("Rx : {:#010X}", rx.rx().pull());
@@ -145,7 +169,7 @@ async fn main(_spawner: Spawner) {
         // assert!(rx.rx().empty());
     }
 
-    info!("Done!!!");
+    // info!("Done!!!");
 
     loop {}
 }
