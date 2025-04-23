@@ -78,7 +78,7 @@ async fn main(_spawner: Spawner) {
         // pin direction and read/write irqs are managed by oneb_tx
         let oneb_rx = pio_asm!(
             // "wait 0 irq 1", f/ wait for writing flag clear
-            "wait 1 irq 0", // wait for clk
+            "wait 0 irq 0", // wait for clk
             "loop:",
             "in pins, 1",
             "jmp loop",
@@ -105,7 +105,9 @@ async fn main(_spawner: Spawner) {
         cfg.clock_divider = div.into();
         cfg.fifo_join = FifoJoin::TxOnly;
         let mut shift_cfg = ShiftConfig::default();
+        shift_cfg.threshold = 32;
         shift_cfg.direction = ShiftDirection::Left;
+        shift_cfg.auto_fill = true;
         cfg.shift_out = shift_cfg;
         tx_sm.set_config(&cfg);
         tx_sm.set_pin_dirs(Direction::Out, &[&tx_pin]);
@@ -120,7 +122,9 @@ async fn main(_spawner: Spawner) {
         cfg.clock_divider = div.into();
         cfg.fifo_join = FifoJoin::RxOnly;
         let mut shift_cfg = ShiftConfig::default();
+        // shift_cfg.threshold = 32;
         shift_cfg.direction = ShiftDirection::Left;
+        // shift_cfg.auto_fill = true;
         cfg.shift_in = shift_cfg;
         rx_sm.set_config(&cfg);
         rx_sm.set_pin_dirs(Direction::In, &[&rx_pin]);
@@ -132,7 +136,8 @@ async fn main(_spawner: Spawner) {
 
     loop {
         // while tx.tx().full() {}
-        tx.tx().push(0xAAAAAAAA);
+        tx.tx().push(31); // push len
+        tx.tx().push(0xBAAAAAAB);
         // while rx.rx().empty() {}
         info!("Rx : {:#010X}", rx.rx().pull());
         Timer::after_millis(10).await;
