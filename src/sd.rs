@@ -14,14 +14,14 @@ pub enum CmdResponse {
     Short = 47,
 }
 
-pub struct PioSdioPrograms<'d, PIO: Instance> {
+pub struct PioSdPrograms<'d, PIO: Instance> {
     clk: LoadedProgram<'d, PIO>,
     cmd: LoadedProgram<'d, PIO>,
     oneb_tx: LoadedProgram<'d, PIO>,
     oneb_rx: LoadedProgram<'d, PIO>,
 }
 
-impl<'d, PIO: Instance> PioSdioPrograms<'d, PIO> {
+impl<'d, PIO: Instance> PioSdPrograms<'d, PIO> {
     /// Loads 23 instructions into pio, and uses 4 state machines
     pub fn new(pio: &mut Common<'d, PIO>) -> Self {
         let clk = pio_asm!(
@@ -89,7 +89,7 @@ impl<'d, PIO: Instance> PioSdioPrograms<'d, PIO> {
     }
 }
 
-pub struct PioSdio<
+pub struct PioSd<
     'd,
     PIO: Instance,
     C: Channel,
@@ -114,7 +114,7 @@ impl<
     const SM1: usize,
     const SM2: usize,
     const SM3: usize,
-> PioSdio<'d, PIO, C, SM0, SM1, SM2, SM3>
+> PioSd<'d, PIO, C, SM0, SM1, SM2, SM3>
 {
     pub fn new_1_bit(
         pio: &mut Common<'d, PIO>,
@@ -125,7 +125,7 @@ impl<
         clk_pin: impl PioPin,
         cmd_pin: impl PioPin,
         d0_pin: impl PioPin,
-        programs: PioSdioPrograms<'d, PIO>,
+        programs: PioSdPrograms<'d, PIO>,
         dma: C,
     ) -> Self {
         into_ref!(dma);

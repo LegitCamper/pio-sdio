@@ -15,8 +15,8 @@ use embassy_rp::{Peripheral, bind_interrupts, into_ref};
 use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
-mod sdio;
-use sdio::{PioSdio, PioSdioPrograms};
+mod sd;
+use sd::{PioSd, PioSdPrograms};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -35,8 +35,8 @@ async fn main(_spawner: Spawner) {
         ..
     } = Pio::new(p.PIO0, Irqs);
 
-    // let programs = PioSdioPrograms::new(&mut common);
-    // let mut sdio = PioSdio::new_1_bit(
+    // let programs = PioSdPrograms::new(&mut common);
+    // let mut sd = PioSd::new_1_bit(
     //     &mut common,
     //     sm0,
     //     sm1,
@@ -62,23 +62,24 @@ async fn main(_spawner: Spawner) {
         );
         let clk = common.load_program(&clk.program);
 
+        // before data can be written, length of data in bits, needs to be pushed
         let oneb_tx = pio_asm!(
-            // ".side_set 1 opt pindirs",
-            "out x, 32",
-            // "irq 1          side 1", // raise write, set d0 as output
-            "wait 0 irq 0", // wait for clk
+            "set pins, 1", // idle high
+            "out x, 32",   // stall waiting for data len
+            "set pindirs, 1",
+            "wait 0 irq 0", // sync clk
             "loop:",
             "out pins, 1",
             "jmp x-- loop",
-            // "irq clear 1    side 0", // clear write, set d0 as input
-            options(max_program_size = 5)
+            options(max_program_size = 7)
         );
         let oneb_tx = common.load_program(&oneb_tx.program);
 
-        // pin direction and read/write irqs are managed by oneb_tx
+        // requires sm to be stopped when not reading to avoid conflicts with tx
         let oneb_rx = pio_asm!(
-            // "wait 0 irq 1", f/ wait for writing flag clear
-            "wait 0 irq 0", // wait for clk
+            "set pindirs, 0",
+            "wait 0 pin, 0", // wait until DAT goes low (start bit)
+            "wait 1 irq 0",  // sync clk
             "loop:",
             "in pins, 1",
             "jmp loop",
@@ -102,6 +103,7 @@ async fn main(_spawner: Spawner) {
         let mut cfg = pio::Config::default();
         cfg.use_program(&oneb_tx, &[]);
         cfg.set_out_pins(&[&tx_pin]);
+        cfg.set_set_pins(&[&tx_pin]);
         cfg.clock_divider = div.into();
         cfg.fifo_join = FifoJoin::TxOnly;
         let mut shift_cfg = ShiftConfig::default();
@@ -119,17 +121,18 @@ async fn main(_spawner: Spawner) {
         let mut cfg = pio::Config::default();
         cfg.use_program(&oneb_rx, &[]);
         cfg.set_in_pins(&[&rx_pin]);
+        cfg.set_set_pins(&[&rx_pin]);
         cfg.clock_divider = div.into();
         cfg.fifo_join = FifoJoin::RxOnly;
         let mut shift_cfg = ShiftConfig::default();
-        // shift_cfg.threshold = 32;
+        shift_cfg.threshold = 32;
         shift_cfg.direction = ShiftDirection::Left;
-        // shift_cfg.auto_fill = true;
+        shift_cfg.auto_fill = true;
         cfg.shift_in = shift_cfg;
         rx_sm.set_config(&cfg);
         rx_sm.set_pin_dirs(Direction::In, &[&rx_pin]);
         rx_sm.clear_fifos();
-        rx_sm.set_enable(true);
+        rx_sm.set_enable(false);
 
         (clk_sm, tx_sm, rx_sm)
     };
@@ -160,13 +163,19 @@ async fn main(_spawner: Spawner) {
     // info!("RX: {}", test_read);
 
     loop {
-        while tx.tx().full() {}
-        tx.tx().push(0xBAAAAAAB);
-        // while rx.rx().empty() {}
+        rx.set_enable(true);
+        rx.clear_fifos();
+        rx.restart();
+
+        tx.tx().push(0xAAAAAAAA);
         info!("Rx : {:#010X}", rx.rx().pull());
+
+        rx.set_enable(false);
+        rx.clear_fifos();
+
         Timer::after_millis(10).await;
-        // assert!(tx.tx().empty());
-        // assert!(rx.rx().empty());
+        assert!(tx.tx().empty());
+        assert!(rx.rx().empty());
     }
 
     // info!("Done!!!");
