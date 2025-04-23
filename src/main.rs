@@ -12,6 +12,7 @@ use embassy_rp::pio::{
     self, Direction, FifoJoin, InterruptHandler, Pio, ShiftConfig, ShiftDirection, StateMachine,
 };
 use embassy_rp::{Peripheral, bind_interrupts};
+use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
 mod sdio;
@@ -19,7 +20,6 @@ use sdio::{PioSdio, PioSdioPrograms};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
-    // PIO0_IRQ_0 => InterruptHandler<PIO0>;
 });
 
 #[embassy_executor::main]
@@ -53,40 +53,35 @@ async fn main(_spawner: Spawner) {
     let mut clk_sm = sm0;
     let mut tx_sm = sm1;
     let mut rx_sm = sm2;
-    let (mut clk, mut tx, mut rx) = {
+    let (_clk, mut tx, mut rx) = {
         let clk = pio_asm!(
             ".side_set 1",
-            "irq 0 side 1",
-            "irq clear 0 side 0",
+            "irq 0 side 1",       // rising edge
+            "irq clear 0 side 0", // falling edge
             options(max_program_size = 2)
         );
         let clk = common.load_program(&clk.program);
 
-        // the first word pushed before any data must be the length of the data
-        // when not writing, pin direction is set as input and the write flag is cleared allowing reads to occur
         let oneb_tx = pio_asm!(
             // ".side_set 1 opt pindirs",
-            // "irq clear 1    side 0", // clear write, set d0 as input
-            "out y, 32", // set y to counter
-            "pull",
+            "out x, 32",
             // "irq 1          side 1", // raise write, set d0 as output
-            "wait 0 irq 0",
-            "lp:", // write word from osr
+            "wait 0 irq 0", // wait for clk
+            "loop:",
             "out pins, 1",
-            "jmp y-- lp",
-            options(max_program_size = 7)
+            "jmp x-- loop",
+            // "irq clear 1    side 0", // clear write, set d0 as input
+            options(max_program_size = 5)
         );
         let oneb_tx = common.load_program(&oneb_tx.program);
 
-        // before data can be read, the length of data needs to be set
         // pin direction and read/write irqs are managed by oneb_tx
         let oneb_rx = pio_asm!(
             // "wait 0 irq 1", f/ wait for writing flag clear
-            "wait 0 irq 0",
-            "lp:", // read word into isr
+            "wait 1 irq 0", // wait for clk
+            "loop:",
             "in pins, 1",
-            "jmp x-- lp",
-            "push",
+            "jmp loop",
             options(max_program_size = 5)
         );
         let oneb_rx = common.load_program(&oneb_rx.program);
@@ -94,7 +89,7 @@ async fn main(_spawner: Spawner) {
         let div = (clk_sys_freq() / 400_000) as u16;
 
         // Clk program config
-        let clk_pin = common.make_pio_pin(p.PIN_1);
+        let clk_pin = common.make_pio_pin(p.PIN_2);
         let mut cfg = pio::Config::default();
         cfg.use_program(&clk, &[&clk_pin]);
         cfg.clock_divider = div.into();
@@ -103,49 +98,47 @@ async fn main(_spawner: Spawner) {
         clk_sm.set_enable(true);
 
         // Tx program config
-        let tx_pin = common.make_pio_pin(p.PIN_2);
+        let tx_pin = common.make_pio_pin(p.PIN_3);
         let mut cfg = pio::Config::default();
         cfg.use_program(&oneb_tx, &[]);
         cfg.set_out_pins(&[&tx_pin]);
         cfg.clock_divider = div.into();
         cfg.fifo_join = FifoJoin::TxOnly;
-
         let mut shift_cfg = ShiftConfig::default();
-        shift_cfg.threshold = 32;
         shift_cfg.direction = ShiftDirection::Left;
-        shift_cfg.auto_fill = true;
         cfg.shift_out = shift_cfg;
-
         tx_sm.set_config(&cfg);
+        tx_sm.set_pin_dirs(Direction::Out, &[&tx_pin]);
         tx_sm.clear_fifos();
         tx_sm.set_enable(true);
 
         // Rx program config
-        let rx_pin = common.make_pio_pin(p.PIN_3);
+        let rx_pin = common.make_pio_pin(p.PIN_4);
         let mut cfg = pio::Config::default();
         cfg.use_program(&oneb_rx, &[]);
         cfg.set_in_pins(&[&rx_pin]);
         cfg.clock_divider = div.into();
         cfg.fifo_join = FifoJoin::RxOnly;
+        let mut shift_cfg = ShiftConfig::default();
+        shift_cfg.direction = ShiftDirection::Left;
+        cfg.shift_in = shift_cfg;
         rx_sm.set_config(&cfg);
+        rx_sm.set_pin_dirs(Direction::In, &[&rx_pin]);
         rx_sm.clear_fifos();
         rx_sm.set_enable(true);
 
         (clk_sm, tx_sm, rx_sm)
     };
 
-    unsafe {
-        rx.set_x(62);
-    };
-    info!("Rx X: {}", unsafe { rx.get_x() });
-
-    tx.tx().push(64); // num bits
-    tx.tx().push(1000);
-    tx.tx().push(1005);
-    info!("Pushed Commands, awaiting transfer");
-
-    info!("Data read: {}", rx.rx().pull());
-    info!("Data read: {}", rx.rx().pull());
+    loop {
+        // while tx.tx().full() {}
+        tx.tx().push(0xAAAAAAAA);
+        // while rx.rx().empty() {}
+        info!("Rx : {:#010X}", rx.rx().pull());
+        Timer::after_millis(10).await;
+        // assert!(tx.tx().empty());
+        // assert!(rx.rx().empty());
+    }
 
     info!("Done!!!");
 
