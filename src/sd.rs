@@ -7,12 +7,9 @@ use embassy_rp::pio::{
 };
 use embassy_rp::{PeripheralRef, into_ref};
 use embassy_time::Timer;
+use embedded_sdmmc::sdcard::proto::*;
+use embedded_sdmmc::sdcard::{AcquireOpts, CardType, Error};
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
-
-pub enum CmdResponse {
-    Long = 135,
-    Short = 47,
-}
 
 pub struct PioSdPrograms<'d, PIO: Instance> {
     clk: LoadedProgram<'d, PIO>,
@@ -23,7 +20,7 @@ pub struct PioSdPrograms<'d, PIO: Instance> {
 
 impl<'d, PIO: Instance> PioSdPrograms<'d, PIO> {
     /// Loads 23 instructions into pio, and uses 4 state machines
-    pub fn new(pio: &mut Common<'d, PIO>) -> Self {
+    pub fn new(common: &mut Common<'d, PIO>) -> Self {
         let clk = pio_asm!(
             ".side_set 1",
             "irq 0 side 1",
@@ -53,38 +50,34 @@ impl<'d, PIO: Instance> PioSdPrograms<'d, PIO> {
             options(max_program_size = 10)
         );
 
-        // the first word pushed before any data must be the length of the data
-        // when not writing, pin direction is set as input and the write flag is cleared allowing reads to occur
+        // before data can be written, length of data in bits, needs to be pushed
         let oneb_tx = pio_asm!(
-            ".side_set 1 opt pindirs",
-            "irq clear 1    side 0", // clear write, set d0 as input
-            "pull block",            // wait for data
-            "out y, 32",             // set y to counter
-            "irq 1          side 1", // raise write, set d0 as output
-            "wait 0 irq 0",
-            "lp:", // write word from osr
+            "set pins, 1", // idle high
+            "out x, 32",   // stall waiting for data len
+            "set pindirs, 1",
+            "wait 0 irq 0", // sync clk
+            "loop:",
             "out pins, 1",
-            "jmp y-- lp",
+            "jmp x-- loop",
             options(max_program_size = 7)
         );
 
-        // before data can be read, the length of data needs to be set
-        // pin direction and read/write irqs are managed by oneb_tx
+        // requires sm to be stopped when not reading to avoid conflicts with tx
         let oneb_rx = pio_asm!(
-            "wait 0 irq 1", // wait for writing flag clear
-            "wait 0 irq 0",
-            "lp:", // read word into isr
+            "set pindirs, 0",
+            "wait 0 pin, 0", // wait until DAT goes low (start bit)
+            "wait 1 irq 0",  // sync clk
+            "loop:",
             "in pins, 1",
-            "jmp x-- lp",
-            "push",
+            "jmp loop",
             options(max_program_size = 5)
         );
 
         Self {
-            clk: pio.load_program(&clk.program),
-            cmd: pio.load_program(&cmd.program),
-            oneb_tx: pio.load_program(&oneb_tx.program),
-            oneb_rx: pio.load_program(&oneb_rx.program),
+            clk: common.load_program(&clk.program),
+            cmd: common.load_program(&cmd.program),
+            oneb_tx: common.load_program(&oneb_tx.program),
+            oneb_rx: common.load_program(&oneb_rx.program),
         }
     }
 }
@@ -164,10 +157,16 @@ impl<
 
         // Tx program config
         let mut cfg = pio::Config::default();
-        cfg.use_program(&programs.oneb_tx, &[&d0]);
+        cfg.use_program(&programs.oneb_tx, &[]);
         cfg.set_out_pins(&[&d0]);
+        cfg.set_set_pins(&[&d0]);
         cfg.clock_divider = div.into();
         cfg.fifo_join = FifoJoin::TxOnly;
+        let mut shift_cfg = ShiftConfig::default();
+        shift_cfg.threshold = 32;
+        shift_cfg.direction = ShiftDirection::Left;
+        shift_cfg.auto_fill = true;
+        cfg.shift_in = shift_cfg;
         tx_sm.set_config(&cfg);
         tx_sm.clear_fifos();
         tx_sm.set_enable(true);
@@ -176,11 +175,17 @@ impl<
         let mut cfg = pio::Config::default();
         cfg.use_program(&programs.oneb_rx, &[]);
         cfg.set_in_pins(&[&d0]);
+        cfg.set_set_pins(&[&d0]);
         cfg.clock_divider = div.into();
         cfg.fifo_join = FifoJoin::RxOnly;
+        let mut shift_cfg = ShiftConfig::default();
+        shift_cfg.threshold = 32;
+        shift_cfg.direction = ShiftDirection::Left;
+        shift_cfg.auto_fill = true;
+        cfg.shift_in = shift_cfg;
         rx_sm.set_config(&cfg);
         rx_sm.clear_fifos();
-        rx_sm.set_enable(true);
+        rx_sm.set_enable(false);
 
         Self {
             dma,
@@ -203,13 +208,27 @@ impl<
         self.cmd_sm.tx().push(47);
     }
 
-    /// writes command
-    fn write_cmd(&mut self, cmd: &[u32], response: CmdResponse) {
-        assert!(cmd.len() == 2);
+    /// Spin until the card returns 0xFF, or we spin too many times and
+    /// timeout.
+    fn wait_not_busy(&mut self, mut delay: Delay) -> Result<(), Error> {
+        loop {
+            let s = self.read_cmd()?;
+            if s == 0xFF {
+                break;
+            }
+            delay.delay(&mut self.delayer, Error::TimeoutWaitNotBusy)?;
+        }
+        Ok(())
+    }
 
-        // write 2 cmd words
-        self.cmd_sm.tx().push(cmd[0]); // first 32 bits of cmd
-        self.cmd_sm.tx().push(((cmd[1]) << 16) | response as u32); // last 16 bits of cmd + response len
+    /// writes command
+    fn write_cmd(&mut self, command: u8, arg: u32) -> Result<u8, Error> {
+        // assert!(cmd.len() == 2);
+
+        // // write 2 cmd words
+        // self.cmd_sm.tx().push(cmd[0]); // first 32 bits of cmd
+        // self.cmd_sm.tx().push(((cmd[1]) << 16) | response as u32); // last 16 bits of cmd + response len
+        //
     }
 
     fn read_cmd(&mut self, buff: &mut [u32]) {
@@ -222,18 +241,106 @@ impl<
         }
     }
 
+    // write single byte to bus
+    fn write_word<'b>(&'b mut self, word: u32) {
+        self.tx_sm.tx().push(31);
+        while self.tx_sm.tx().full() {}
+        self.tx_sm.tx().push(word);
+    }
+
+    // read single byte from bus
+    fn read_word<'b>(&'b mut self) -> u32 {
+        self.rx_sm.clear_fifos();
+        self.rx_sm.restart();
+        self.rx_sm.set_enable(true);
+
+        while self.rx_sm.rx().empty() {}
+        self.rx_sm.rx().pull()
+    }
+
     /// Return an in-prograss dma transfer future. Awaiting it will guarantee a complete transfer.
-    fn write<'b>(&'b mut self, buff: &'b [u32], len: u32) -> Transfer<'b, C> {
-        self.tx_sm.tx().push(len - 1);
+    fn write<'b>(&'b mut self, buff: &'b [u32]) -> Transfer<'b, C> {
+        self.tx_sm.tx().push(buff.len() as u32 * 31);
         self.tx_sm.tx().dma_push(self.dma.reborrow(), buff, false)
     }
 
     /// Return an in-prograss dma transfer future. Awaiting it will guarantee a complete transfer.
-    fn read<'b>(&'b mut self, buff: &'b mut [u32], len: u32) -> Transfer<'b, C> {
-        // Because the fifos are tied, there is no other way to set counter
-        unsafe {
-            self.rx_sm.set_x(len - 1);
-        }
+    fn read<'b>(&'b mut self, buff: &'b mut [u32]) -> Transfer<'b, C> {
+        self.rx_sm.clear_fifos();
+        self.rx_sm.restart();
+        self.rx_sm.set_enable(true);
+
         self.rx_sm.rx().dma_pull(self.dma.reborrow(), buff, false)
+    }
+}
+
+/// This an object you can use to busy-wait with a timeout.
+///
+/// Will let you call `delay` up to `max_retries` times before `delay` returns
+/// an error.
+struct Delay {
+    retries_left: u32,
+}
+
+impl Delay {
+    /// The default number of retries for a read operation.
+    ///
+    /// At ~10us each this is ~100ms.
+    ///
+    /// See `Part1_Physical_Layer_Simplified_Specification_Ver9.00-1.pdf` Section 4.6.2.1
+    pub const DEFAULT_READ_RETRIES: u32 = 10_000;
+
+    /// The default number of retries for a write operation.
+    ///
+    /// At ~10us each this is ~500ms.
+    ///
+    /// See `Part1_Physical_Layer_Simplified_Specification_Ver9.00-1.pdf` Section 4.6.2.2
+    pub const DEFAULT_WRITE_RETRIES: u32 = 50_000;
+
+    /// The default number of retries for a control command.
+    ///
+    /// At ~10us each this is ~100ms.
+    ///
+    /// No value is given in the specification, so we pick the same as the read timeout.
+    pub const DEFAULT_COMMAND_RETRIES: u32 = 10_000;
+
+    /// Create a new Delay object with the given maximum number of retries.
+    fn new(max_retries: u32) -> Delay {
+        Delay {
+            retries_left: max_retries,
+        }
+    }
+
+    /// Create a new Delay object with the maximum number of retries for a read operation.
+    fn new_read() -> Delay {
+        Delay::new(Self::DEFAULT_READ_RETRIES)
+    }
+
+    /// Create a new Delay object with the maximum number of retries for a write operation.
+    fn new_write() -> Delay {
+        Delay::new(Self::DEFAULT_WRITE_RETRIES)
+    }
+
+    /// Create a new Delay object with the maximum number of retries for a command operation.
+    fn new_command() -> Delay {
+        Delay::new(Self::DEFAULT_COMMAND_RETRIES)
+    }
+
+    /// Wait for a while.
+    ///
+    /// Checks the retry counter first, and if we hit the max retry limit, the
+    /// value `err` is returned. Otherwise we wait for 10us and then return
+    /// `Ok(())`.
+    fn delay<T>(&mut self, delayer: &mut T, err: Error) -> Result<(), Error>
+    where
+        T: embedded_hal::delay::DelayNs,
+    {
+        if self.retries_left == 0 {
+            Err(err)
+        } else {
+            delayer.delay_us(10);
+            self.retries_left -= 1;
+            Ok(())
+        }
     }
 }
