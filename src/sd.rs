@@ -37,11 +37,9 @@ impl<'d, PIO: Instance> PioSdPrograms<'d, PIO> {
             "loop:",
             "out pins, 1",
             "jmp y-- loop",
-            "irq 1", // raise cmd write done
+            "irq set 1", // raise cmd write done
         );
 
-        // before starting the sm, ensure to push 47bit counter
-        // irq1 raised when cmd write is done
         let cmd_rx = pio_asm!(
             "set pindirs 0",
             "wait 1 pin, 0"
@@ -90,33 +88,27 @@ pub struct PioSd<
     const SM0: usize,
     const SM1: usize,
     const SM2: usize,
-    const CMDIRQ: usize,
 > {
     pub dma: PeripheralRef<'d, C>,
     pub cfg: pio::Config<'d, PIO>,
+    pub clk_irq: pio::Irq<'d, PIO, 0>,
     pub clk_sm: StateMachine<'d, PIO, SM0>,
-    pub cmd_tx_irq: pio::Irq<'d, PIO, CMDIRQ>,
+    pub cmd_tx_irq: pio::Irq<'d, PIO, 1>,
     pub cmd_tx: pio::Config<'d, PIO>,
     pub cmd_rx: pio::Config<'d, PIO>,
     pub cmd_sm: StateMachine<'d, PIO, SM1>,
     // pub data_sm: StateMachine<'d, PIO, SM2>,
 }
 
-impl<
-    'd,
-    PIO: Instance,
-    C: Channel,
-    const SM0: usize,
-    const SM1: usize,
-    const SM2: usize,
-    const CMDIRQ: usize,
-> PioSd<'d, PIO, C, SM0, SM1, SM2, CMDIRQ>
+impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM2: usize>
+    PioSd<'d, PIO, C, SM0, SM1, SM2>
 {
     pub fn new_1_bit(
         pio: &mut Common<'d, PIO>,
         mut clk_sm: StateMachine<'d, PIO, SM0>,
+        clk_irq: pio::Irq<'d, PIO, 0>,
         mut cmd_sm: StateMachine<'d, PIO, SM1>,
-        cmd_tx_irq: pio::Irq<'d, PIO, CMDIRQ>,
+        cmd_tx_irq: pio::Irq<'d, PIO, 1>,
         mut data_sm: StateMachine<'d, PIO, SM2>,
         clk_pin: impl PioPin,
         cmd_pin: impl PioPin,
@@ -138,10 +130,11 @@ impl<
 
         // Cmd program configs
         let cmd = pio.make_pio_pin(cmd_pin);
-        let cmd_tx = Self::cmd_config::<SM1>(&cmd, &programs, div, true);
+        let cmd_tx = Self::cmd_config(&cmd, &programs, div, true);
+        cmd_sm.clear_fifos();
         cmd_sm.set_config(&cmd_tx);
         cmd_sm.set_enable(true);
-        let cmd_rx = Self::cmd_config::<SM1>(&cmd, &programs, div, false);
+        let cmd_rx = Self::cmd_config(&pio.make_pio_pin(d0_pin), &programs, div, false);
 
         // let d0 = pio.make_pio_pin(d0_pin);
 
@@ -180,6 +173,7 @@ impl<
         Self {
             dma,
             cfg,
+            clk_irq,
             clk_sm,
             cmd_tx_irq,
             cmd_tx,
@@ -190,7 +184,7 @@ impl<
         }
     }
 
-    pub fn cmd_config<const SM: usize>(
+    pub fn cmd_config(
         pin: &pio::Pin<'d, PIO>,
         programs: &PioSdPrograms<'d, PIO>,
         div: u16,
@@ -199,7 +193,7 @@ impl<
         let mut cfg = pio::Config::default();
 
         let mut shift_cfg = ShiftConfig::default();
-        shift_cfg.threshold = 16;
+        shift_cfg.threshold = 32;
         shift_cfg.direction = ShiftDirection::Left;
         shift_cfg.auto_fill = true;
 

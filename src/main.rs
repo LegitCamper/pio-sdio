@@ -6,6 +6,7 @@ use core::borrow::BorrowMut;
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::dma::Channel;
 use embassy_rp::gpio::Output;
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::program::pio_asm;
@@ -32,19 +33,17 @@ async fn main(_spawner: Spawner) {
         sm0,
         sm1,
         sm2,
-        irq0: _,
+        mut sm3,
+        irq0,
         irq1,
         ..
     } = Pio::new(p.PIO0, Irqs);
-
-    // let mut pin = Output::new(p.PIN_3, embassy_rp::gpio::Level::Low);
-    // Timer::after_secs(1).await;
-    // pin.set_high();
 
     let programs = PioSdPrograms::new(&mut common);
     let mut sd = PioSd::new_1_bit(
         &mut common,
         sm0,
+        irq0,
         sm1,
         irq1,
         sm2,
@@ -55,13 +54,23 @@ async fn main(_spawner: Spawner) {
         p.DMA_CH0,
     );
 
-    // loop {
-    //     while !sd.cmd_sm.tx().empty() {}
-    //     sd.cmd_sm.tx().push(31);
-    //     sd.cmd_sm.tx().push(0xAAAAAAAA);
-    //     // sd.cmd_tx_irq.wait().await;
-    //     Timer::after_millis(50).await;
-    // }
+    sm3.clear_fifos();
+    sm3.set_config(&sd.cmd_rx);
+    sm3.set_enable(true);
+
+    loop {
+        sd.cmd_sm.tx().push(62);
+        sd.cmd_sm.tx().push(0xACAAAAAA);
+        sd.cmd_sm.tx().push(0xACAAACAA);
+
+        sd.cmd_tx_irq.wait().await;
+
+        while !sm3.rx().empty() {}
+        info!("RX: {:#010X}", sm3.rx().pull());
+        info!("RX: {:#010X}", sm3.rx().pull());
+
+        Timer::after_millis(100).await;
+    }
 
     info!("Done!!!");
 
