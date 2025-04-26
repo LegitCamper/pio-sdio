@@ -18,7 +18,7 @@ use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
 mod sd;
-use sd::{PioSd, PioSdPrograms};
+use sd::{PioSdClk, PioSdCmdData, PioSdInternal};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -33,46 +33,32 @@ async fn main(_spawner: Spawner) {
         sm0,
         sm1,
         sm2,
-        mut sm3,
         irq0,
-        irq1,
         ..
     } = Pio::new(p.PIO0, Irqs);
 
-    let programs = PioSdPrograms::new(&mut common);
-    let mut sd = PioSd::new_1_bit(
-        &mut common,
-        sm0,
-        irq0,
-        sm1,
-        irq1,
-        sm2,
+    let cmd_data_prg = PioSdCmdData::new(&mut common);
+    let clk_prg = PioSdClk::new(&mut common);
+    let mut sd = PioSdInternal::new(
         p.PIN_2,
         p.PIN_3,
         p.PIN_4,
-        programs,
+        clk_prg,
+        cmd_data_prg,
+        &mut common,
+        irq0,
+        sm0,
+        sm1,
+        sm2,
         p.DMA_CH0,
     );
 
-    sm3.clear_fifos();
-    sm3.set_config(&sd.cmd_rx);
-    sm3.set_enable(true);
-
-    loop {
-        sd.cmd_sm.tx().push(62);
-        sd.cmd_sm.tx().push(0xACAAAAAA);
-        sd.cmd_sm.tx().push(0xACAAACAA);
-
-        sd.cmd_tx_irq.wait().await;
-
-        while !sm3.rx().empty() {}
-        info!("RX: {:#010X}", sm3.rx().pull());
-        info!("RX: {:#010X}", sm3.rx().pull());
-
+    for _ in 0..10 {
+        sd.test();
         Timer::after_millis(100).await;
     }
 
-    info!("Done!!!");
+    info!("Done!");
 
     loop {}
 }
