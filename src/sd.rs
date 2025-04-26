@@ -8,9 +8,106 @@ use embassy_rp::pio::{
 };
 use embassy_rp::{PeripheralRef, into_ref};
 use embassy_time::Timer;
+use embedded_hal::delay::DelayNs;
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::sdcard::{AcquireOpts, CardType, Error};
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+
+pub struct PioSd<
+    'd,
+    PIO: Instance,
+    C: Channel,
+    const SM0: usize,
+    const SM1: usize,
+    const SM2: usize,
+> {
+    internal: PioSdInner<'d, PIO, C, SM0, SM1, SM2>,
+    delayer: embassy_time::Delay,
+}
+
+impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM2: usize>
+    PioSd<'d, PIO, C, SM0, SM1, SM2>
+{
+    pub fn new(
+        clk_pin: impl PioPin,
+        cmd_pin: impl PioPin,
+        d0_pin: impl PioPin,
+        clk_prg: PioSdClk<'d, PIO>,
+        cmd_or_data_prg: PioSdCmdData<'d, PIO>,
+        pio: &mut Common<'d, PIO>,
+        clk_irq: pio::Irq<'d, PIO, 0>,
+        clk_sm: StateMachine<'d, PIO, SM0>,
+        cmd_sm: StateMachine<'d, PIO, SM1>,
+        data_sm: StateMachine<'d, PIO, SM2>,
+        dma: C,
+    ) -> Self {
+        Self {
+            delayer: embassy_time::Delay,
+            internal: PioSdInner::new(
+                clk_pin,
+                cmd_pin,
+                d0_pin,
+                clk_prg,
+                cmd_or_data_prg,
+                pio,
+                clk_irq,
+                clk_sm,
+                cmd_sm,
+                data_sm,
+                dma,
+            ),
+        }
+    }
+
+    pub fn command(&mut self, command: u8, arg: u32) -> Result<u8, Error> {
+        let mut buf = [
+            0x40 | command,
+            (arg >> 24) as u8,
+            (arg >> 16) as u8,
+            (arg >> 8) as u8,
+            arg as u8,
+            0,
+        ];
+        buf[5] = crc7(&buf[0..5]);
+        info!("Calculated Command: {:#04X}", buf);
+
+        let cmd = self.internal.buf_to_cmd(&buf);
+        self.internal.write_command(cmd.0, cmd.1);
+
+        self.internal.read_command(&mut buf, CmdResponseLen::Short);
+        info!("RX: {:#04X}", buf);
+
+        let mut delay = Delay::new_command();
+        loop {
+            self.internal.read_command(&mut buf, CmdResponseLen::Short);
+            let result = self.parse_cmd_response(&buf);
+            if (0x80) == ERROR_OK {
+                return Ok(result?);
+            }
+            delay.delay(&mut self.delayer, Error::TimeoutCommand(command))?;
+        }
+
+        Ok(8)
+    }
+
+    fn parse_cmd_response(&self, buf: &[u8]) -> Result<u8, Error> {
+        assert!(buf.len() == 6);
+
+        let command_index = (buf[0] >> 2) & 0x3F;
+        let status = ((buf[1] as u32) << 24)
+            | ((buf[2] as u32) << 16)
+            | ((buf[3] as u32) << 8)
+            | (buf[4] as u32);
+        let crc7 = (buf[5] >> 1) & 0x7F;
+        let end_bit = buf[5] & 0x01;
+
+        Ok(ERROR_OK)
+    }
+
+    pub fn reset(&mut self) -> Result<u8, Error> {
+        self.command(CMD0, 0)
+    }
+}
 
 pub struct PioSdClk<'d, PIO: Instance> {
     clk: LoadedProgram<'d, PIO>,
@@ -58,7 +155,7 @@ impl<'d, PIO: Instance> PioSdCmdData<'d, PIO> {
                 
                 public state_inline_instruction:
                     out exec, 16                     ; may be any instruction
-                ;.wrap_target
+                .wrap_target
                     out exec, 16                     ; expected to be a jmp to a state
                 
                 public state_receive_bits:
@@ -71,7 +168,7 @@ impl<'d, PIO: Instance> PioSdCmdData<'d, PIO> {
                 rlp:
                     in pins, 1
                     jmp x-- rlp
-                ;.wrap
+                .wrap
             "#,
         );
         let cmd_or_data = common.load_program(&cmd_or_data_prg.program);
@@ -90,7 +187,7 @@ impl<'d, PIO: Instance> PioSdCmdData<'d, PIO> {
     }
 }
 
-pub struct PioSdInternal<
+pub struct PioSdInner<
     'd,
     PIO: Instance,
     C: Channel,
@@ -110,7 +207,7 @@ pub struct PioSdInternal<
 }
 
 impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM2: usize>
-    PioSdInternal<'d, PIO, C, SM0, SM1, SM2>
+    PioSdInner<'d, PIO, C, SM0, SM1, SM2>
 {
     pub fn new(
         clk_pin: impl PioPin,
@@ -182,6 +279,14 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             data_cfg,
             data_sm,
         }
+    }
+
+    fn buf_to_cmd(&self, buf: &[u8]) -> (u32, u16) {
+        assert!(buf.len() == 6);
+        (
+            (buf[0] as u32) << 24 | (buf[1] as u32) << 16 | (buf[2] as u32) << 8 | buf[3] as u32,
+            (buf[4] as u16) << 8 | buf[5] as u16,
+        )
     }
 
     // writes command to cmd
@@ -288,4 +393,75 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 enum CmdResponseLen {
     Short = 48,
     Long = 148,
+}
+
+/// This an object you can use to busy-wait with a timeout.
+///
+/// Will let you call `delay` up to `max_retries` times before `delay` returns
+/// an error.
+struct Delay {
+    retries_left: u32,
+}
+
+impl Delay {
+    /// The default number of retries for a read operation.
+    ///
+    /// At ~10us each this is ~100ms.
+    ///
+    /// See `Part1_Physical_Layer_Simplified_Specification_Ver9.00-1.pdf` Section 4.6.2.1
+    pub const DEFAULT_READ_RETRIES: u32 = 10_000;
+
+    /// The default number of retries for a write operation.
+    ///
+    /// At ~10us each this is ~500ms.
+    ///
+    /// See `Part1_Physical_Layer_Simplified_Specification_Ver9.00-1.pdf` Section 4.6.2.2
+    pub const DEFAULT_WRITE_RETRIES: u32 = 50_000;
+
+    /// The default number of retries for a control command.
+    ///
+    /// At ~10us each this is ~100ms.
+    ///
+    /// No value is given in the specification, so we pick the same as the read timeout.
+    pub const DEFAULT_COMMAND_RETRIES: u32 = 10_000;
+
+    /// Create a new Delay object with the given maximum number of retries.
+    fn new(max_retries: u32) -> Delay {
+        Delay {
+            retries_left: max_retries,
+        }
+    }
+
+    /// Create a new Delay object with the maximum number of retries for a read operation.
+    fn new_read() -> Delay {
+        Delay::new(Self::DEFAULT_READ_RETRIES)
+    }
+
+    /// Create a new Delay object with the maximum number of retries for a write operation.
+    fn new_write() -> Delay {
+        Delay::new(Self::DEFAULT_WRITE_RETRIES)
+    }
+
+    /// Create a new Delay object with the maximum number of retries for a command operation.
+    fn new_command() -> Delay {
+        Delay::new(Self::DEFAULT_COMMAND_RETRIES)
+    }
+
+    /// Wait for a while.
+    ///
+    /// Checks the retry counter first, and if we hit the max retry limit, the
+    /// value `err` is returned. Otherwise we wait for 10us and then return
+    /// `Ok(())`.
+    fn delay<T>(&mut self, delayer: &mut T, err: Error) -> Result<(), Error>
+    where
+        T: embedded_hal::delay::DelayNs,
+    {
+        if self.retries_left == 0 {
+            Err(err)
+        } else {
+            delayer.delay_us(10);
+            self.retries_left -= 1;
+            Ok(())
+        }
+    }
 }

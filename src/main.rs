@@ -18,7 +18,7 @@ use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
 mod sd;
-use sd::{PioSdClk, PioSdCmdData, PioSdInternal};
+use sd::{PioSd, PioSdClk, PioSdCmdData};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -39,7 +39,7 @@ async fn main(_spawner: Spawner) {
 
     let cmd_data_prg = PioSdCmdData::new(&mut common);
     let clk_prg = PioSdClk::new(&mut common);
-    let mut sd = PioSdInternal::new(
+    let mut sd = PioSd::new(
         p.PIN_2,
         p.PIN_3,
         p.PIN_4,
@@ -53,8 +53,8 @@ async fn main(_spawner: Spawner) {
         p.DMA_CH0,
     );
 
-    for _ in 0..10 {
-        sd.test();
+    for _ in 0..1 {
+        info!("{}", sd.reset());
         Timer::after_millis(100).await;
     }
 
