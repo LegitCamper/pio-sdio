@@ -53,7 +53,7 @@ async fn main(_spawner: Spawner) {
         p.DMA_CH0,
     );
 
-    sd.init().await.unwrap();
+    sd.acquire().await.unwrap();
 
     info!("Done!");
 

@@ -59,7 +59,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         }
     }
 
-    pub fn command(&mut self, command: u8, arg: u32) -> Result<u8, Error> {
+    pub async fn command(&mut self, command: u8, arg: u32) -> Result<u8, Error> {
         let mut buf = [
             0x40 | command,
             (arg >> 24) as u8,
@@ -72,36 +72,43 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         info!("Calculated Command: {:#04X}", buf);
 
         let cmd = self.internal.buf_to_cmd(&buf);
-        self.internal.write_command(cmd.0, cmd.1);
+        self.internal.write_command(cmd.0, cmd.1).await?;
 
         // CMD0 sometimes has no response so just ignore
         if command != CMD0 {
             self.internal.read_command(&mut buf, CmdResponseLen::Short);
             info!("RX: {:#04X}", buf);
+            let (cmd_idx, cmd_status) = self.parse_cmd_response(&buf)?;
+            // info!("RX idx: {:X}, status: {:#04X}", cmd_idx, cmd_status);
         }
+
         Ok(ERROR_OK)
     }
 
-    fn parse_cmd_response(&self, buf: &[u8]) -> Result<u8, Error> {
+    fn parse_cmd_response(&self, buf: &[u8]) -> Result<(u8, u32), Error> {
         assert!(buf.len() == 6);
 
-        let command_index = (buf[0] >> 2) & 0x3F;
+        let command_index = (buf[0] >> 2) & 0x3F; // 6 bits
         let status = ((buf[1] as u32) << 24)
             | ((buf[2] as u32) << 16)
             | ((buf[3] as u32) << 8)
             | (buf[4] as u32);
-        let crc7 = (buf[5] >> 1) & 0x7F;
-        let end_bit = buf[5] & 0x01;
 
-        Ok(ERROR_OK)
+        Ok((command_index, status))
     }
 
-    pub async fn init(&mut self) -> Result<(), Error> {
+    pub async fn acquire(&mut self) -> Result<(), Error> {
         // Send initial clocks (74+)
         Timer::after_millis(1).await;
 
-        self.command(CMD0, 0)?;
-        self.command(CMD8, 0x1AA)?;
+        // Go idle
+        self.command(CMD0, 0).await?;
+        // Check voltage
+        self.command(CMD8, 0x1AA).await?;
+        // App command
+        self.command(CMD55, 0).await?;
+        //
+        self.command(ACMD41, 0x4000_0000).await?;
 
         Ok(())
     }
@@ -288,9 +295,9 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     // writes command to cmd
-    fn write_command(&mut self, upper: u32, lower: u16) {
+    async fn write_command(&mut self, upper: u32, lower: u16) -> Result<(), Error> {
         while !self.cmd_sm.tx().empty() {}
-        self.cmd_wait_ready();
+        self.cmd_wait_ready().await?;
 
         // disable sm to avoid sm stall after first word is read and losing clk
         self.cmd_sm.set_enable(false);
@@ -303,12 +310,17 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.cmd_sm.tx().push((lower as u32) << 16);
 
         self.cmd_sm.set_enable(true);
+        Ok(())
     }
 
     // reads command response to cmd
-    fn read_command(&mut self, buff: &mut [u8], response_len: CmdResponseLen) {
+    async fn read_command(
+        &mut self,
+        buff: &mut [u8],
+        response_len: CmdResponseLen,
+    ) -> Result<(), Error> {
         while !self.cmd_sm.tx().empty() {}
-        self.cmd_wait_ready();
+        self.cmd_wait_ready().await?;
 
         // jmp to recv_bits and set bit counter to response_len
         let jmp_read = self.get_jmp(self.cmd_or_data_prg.state_receive_bits as u8);
@@ -336,10 +348,27 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             CmdResponseLen::Long => todo!(),
         }
 
+        // push remaining bits out of isr
+        let jmp_instruction = self.get_jmp(self.cmd_or_data_prg.state_inline_instruction as u8);
+        let push_inst = Instruction {
+            operands: pio::program::InstructionOperands::PUSH {
+                if_full: false,
+                block: false,
+            },
+            delay: 0,
+            side_set: None,
+        };
+        self.cmd_sm
+            .tx()
+            .push(jmp_instruction << 16 | push_inst.encode(SideSet::default()) as u32);
+
         // set cmd pin back as output and wait for next state
         let jmp_wait_high = self.get_jmp(self.cmd_or_data_prg.no_arg_state_wait_high as u8);
         let jmp_wait_cmd = self.get_jmp(self.cmd_or_data_prg.no_arg_state_waiting_for_cmd as u8);
         self.cmd_sm.tx().push(jmp_wait_high << 16 | jmp_wait_cmd);
+
+        self.cmd_wait_ready().await?;
+        Ok(())
     }
 
     // create a jmp exec instruction to an address
@@ -356,33 +385,18 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     // checks if sm is at a exec instruction and ready to jmp to next state
-    fn cmd_wait_ready(&self) {
-        // todo timeout and return card stuck
-        while self.cmd_sm.get_addr() as u32 != self.cmd_or_data_prg.no_arg_state_waiting_for_cmd
-            && self.cmd_sm.get_addr() as u32 != self.cmd_or_data_prg.state_inline_instruction
-            && self.cmd_sm.get_addr() as u32 != self.cmd_or_data_prg.state_inline_instruction + 2
-        {
-            // info!("Addr: {}", self.cmd_sm.get_addr());
-            // info!(
-            //     "Should be: {}",
-            //     self.cmd_or_data_prg.state_inline_instruction
-            // );
+    async fn cmd_wait_ready(&self) -> Result<(), Error> {
+        for _ in 0..1000 {
+            if self.cmd_sm.get_addr() as u32 == self.cmd_or_data_prg.no_arg_state_waiting_for_cmd
+                || self.cmd_sm.get_addr() as u32 == self.cmd_or_data_prg.state_inline_instruction
+                || self.cmd_sm.get_addr() as u32
+                    == self.cmd_or_data_prg.state_inline_instruction + 2
+            {
+                return Ok(());
+            }
+            Timer::after_micros(5).await;
         }
-    }
-
-    pub fn test(&mut self) {
-        let mut read_buf = [0_u8; CmdResponseLen::Short as usize / 8];
-        self.cmd_wait_ready();
-        let cmd0_hi: u32 = 0x4000_0000;
-        let cmd0_lo: u16 = 0x0095;
-        self.write_command(cmd0_hi, cmd0_lo);
-        self.cmd_wait_ready();
-        info!("Completed Write");
-
-        self.read_command(&mut read_buf, CmdResponseLen::Short);
-        info!("Read done, waiting for done sig");
-        self.cmd_wait_ready();
-        info!("RX: {:#04X}", read_buf);
+        Err(Error::TimeoutWaitNotBusy)
     }
 }
 
@@ -391,75 +405,4 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 enum CmdResponseLen {
     Short = 48,
     Long = 148,
-}
-
-/// This an object you can use to busy-wait with a timeout.
-///
-/// Will let you call `delay` up to `max_retries` times before `delay` returns
-/// an error.
-struct Delay {
-    retries_left: u32,
-}
-
-impl Delay {
-    /// The default number of retries for a read operation.
-    ///
-    /// At ~10us each this is ~100ms.
-    ///
-    /// See `Part1_Physical_Layer_Simplified_Specification_Ver9.00-1.pdf` Section 4.6.2.1
-    pub const DEFAULT_READ_RETRIES: u32 = 10_000;
-
-    /// The default number of retries for a write operation.
-    ///
-    /// At ~10us each this is ~500ms.
-    ///
-    /// See `Part1_Physical_Layer_Simplified_Specification_Ver9.00-1.pdf` Section 4.6.2.2
-    pub const DEFAULT_WRITE_RETRIES: u32 = 50_000;
-
-    /// The default number of retries for a control command.
-    ///
-    /// At ~10us each this is ~100ms.
-    ///
-    /// No value is given in the specification, so we pick the same as the read timeout.
-    pub const DEFAULT_COMMAND_RETRIES: u32 = 10_000;
-
-    /// Create a new Delay object with the given maximum number of retries.
-    fn new(max_retries: u32) -> Delay {
-        Delay {
-            retries_left: max_retries,
-        }
-    }
-
-    /// Create a new Delay object with the maximum number of retries for a read operation.
-    fn new_read() -> Delay {
-        Delay::new(Self::DEFAULT_READ_RETRIES)
-    }
-
-    /// Create a new Delay object with the maximum number of retries for a write operation.
-    fn new_write() -> Delay {
-        Delay::new(Self::DEFAULT_WRITE_RETRIES)
-    }
-
-    /// Create a new Delay object with the maximum number of retries for a command operation.
-    fn new_command() -> Delay {
-        Delay::new(Self::DEFAULT_COMMAND_RETRIES)
-    }
-
-    /// Wait for a while.
-    ///
-    /// Checks the retry counter first, and if we hit the max retry limit, the
-    /// value `err` is returned. Otherwise we wait for 10us and then return
-    /// `Ok(())`.
-    fn delay<T>(&mut self, delayer: &mut T, err: Error) -> Result<(), Error>
-    where
-        T: embedded_hal::delay::DelayNs,
-    {
-        if self.retries_left == 0 {
-            Err(err)
-        } else {
-            delayer.delay_us(10);
-            self.retries_left -= 1;
-            Ok(())
-        }
-    }
 }
