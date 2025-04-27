@@ -74,20 +74,12 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let cmd = self.internal.buf_to_cmd(&buf);
         self.internal.write_command(cmd.0, cmd.1);
 
-        self.internal.read_command(&mut buf, CmdResponseLen::Short);
-        info!("RX: {:#04X}", buf);
-
-        let mut delay = Delay::new_command();
-        loop {
+        // CMD0 sometimes has no response so just ignore
+        if command != CMD0 {
             self.internal.read_command(&mut buf, CmdResponseLen::Short);
-            let result = self.parse_cmd_response(&buf);
-            if (0x80) == ERROR_OK {
-                return Ok(result?);
-            }
-            delay.delay(&mut self.delayer, Error::TimeoutCommand(command))?;
+            info!("RX: {:#04X}", buf);
         }
-
-        Ok(8)
+        Ok(ERROR_OK)
     }
 
     fn parse_cmd_response(&self, buf: &[u8]) -> Result<u8, Error> {
@@ -104,8 +96,14 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         Ok(ERROR_OK)
     }
 
-    pub fn reset(&mut self) -> Result<u8, Error> {
-        self.command(CMD0, 0)
+    pub async fn init(&mut self) -> Result<(), Error> {
+        // Send initial clocks (74+)
+        Timer::after_millis(1).await;
+
+        self.command(CMD0, 0)?;
+        self.command(CMD8, 0x1AA)?;
+
+        Ok(())
     }
 }
 

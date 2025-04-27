@@ -53,10 +53,7 @@ async fn main(_spawner: Spawner) {
         p.DMA_CH0,
     );
 
-    for _ in 0..1 {
-        info!("{}", sd.reset());
-        Timer::after_millis(100).await;
-    }
+    sd.init().await.unwrap();
 
     info!("Done!");
 
