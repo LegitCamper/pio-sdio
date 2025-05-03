@@ -1,4 +1,4 @@
-use defmt::{debug, info, trace, warn};
+use defmt::{debug, expect, info, trace, unwrap, warn};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::{Channel, Transfer};
 use embassy_rp::pio::program::{Instruction, Program, SideSet, pio_asm};
@@ -63,12 +63,12 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     /// ensure cmd pio is ready otherwise return timeout and reset
-    fn cmd_delay_ready(&mut self, delay: &mut Delay) -> Result<(), ()> {
+    fn cmd_delay_ready(&mut self, delay: &mut Delay) -> Result<(), Error> {
         while !self.inner.cmd_ready() {
-            delay.check().map_err(|_| {
-                warn!("Command timed out");
+            if delay.check().is_err() {
                 self.inner.reset_cmd();
-            })?;
+                return Err(Error::Transport);
+            };
         }
         Ok(())
     }
@@ -88,21 +88,28 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         buf[5] = crc7(&buf[0..5]);
         info!("Tx: {:#04X}", buf);
 
-        let cmd = self.inner.buf_to_cmd(&buf);
+        self.cmd_delay_ready(&mut delay)?;
 
-        self.cmd_delay_ready(&mut delay)
-            .map_err(|_| Error::TimeoutCommand(command))?;
+        let cmd = self.inner.buf_to_cmd(&buf);
         self.inner.write_command(cmd.0, cmd.1);
 
-        self.cmd_delay_ready(&mut delay)
-            .map_err(|_| Error::TimeoutCommand(command))?;
-        self.inner.read_command(&mut buf, CmdResponseLen::Short);
-        info!("RX: {:#04X}", buf);
-        let (cmd_idx, cmd_status) = self.parse_cmd_response(&buf)?;
+        self.cmd_delay_ready(&mut delay)?;
+
+        let mut read = [0; CmdResponseLen::Short as usize / 8];
+        self.inner.read_command(&mut read, CmdResponseLen::Short);
+        info!("RX: {:#04X}", read);
+        // let (cmd_idx, cmd_status) = self.parse_cmd_response(&buf)?;
         // info!("RX idx: {:X}, status: {:#04X}", cmd_idx, cmd_status);
 
-        self.cmd_delay_ready(&mut delay)
-            .map_err(|_| Error::TimeoutCommand(command))?;
+        for byte in read {
+            if (byte & 0x80) == ERROR_OK {
+                return Ok(byte);
+            }
+        }
+
+        info!("Good");
+        self.cmd_delay_ready(&mut delay)?;
+        info!("bad");
 
         Ok(ERROR_OK)
     }
@@ -126,21 +133,39 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         trace!("Reset card..");
 
         // Sleep for initial clocks (74+)
-        let _ = self.cmd_delay_ready(&mut Delay::new(1000));
+        Delay::new(1000).delay();
 
-        for _attempts in 0..self.options.acquire_retries {
-            trace!("Enter SDIO mode, attempt: {}..", _attempts);
-
-            // Go idle - some cards dont respond
-            let _ = self.card_command(CMD0, 0);
-            // Check voltage
-            let _ = self.card_command(CMD8, 0x1AA);
-
-            // App command
-            let _ = self.card_command(CMD55, 0);
-            //
-            let _ = self.card_command(ACMD41, 0x4000_0000);
+        for attempts in 1..self.options.acquire_retries {
+            trace!("Enter SD mode, attempt: {}", attempts);
+            match self.card_command(CMD0, 0) {
+                Err(Error::TimeoutCommand(CMD0)) => {
+                    warn!("Timed out, trying again..");
+                    self.inner.reset_cmd();
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+                Ok(R1_IDLE_STATE) => {
+                    break;
+                }
+                Ok(_r) => {
+                    // Try again
+                    warn!("Got response: {:x}, trying again..", _r);
+                }
+            }
+            if attempts == self.options.acquire_retries {
+                Err(Error::CardNotFound)?
+            }
+            Delay::new(10);
         }
+
+        // // Check voltage
+        // let _ = self.card_command(CMD8, 0x1AA);
+
+        // // App command
+        // let _ = self.card_command(CMD55, 0);
+        // //
+        // let _ = self.card_command(ACMD41, 0x4000_0000);
 
         Ok(())
     }
@@ -260,7 +285,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         dma: C,
     ) -> Self {
         into_ref!(dma);
-        let div = (clk_sys_freq() / 400_000) as u16;
+        let freq = 200_000;
+        let div = (clk_sys_freq() / freq) as u16;
 
         // Clk program config
         let clk = pio.make_pio_pin(clk_pin);
@@ -326,7 +352,11 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         )
     }
 
+    /// writes cmd to sm
+    /// requires sm to be at exec to jmp to write state
     fn write_command(&mut self, upper: u32, lower: u16) {
+        assert!(self.cmd_ready());
+
         // disable sm to avoid sm stall after first word is read and losing clk
         self.cmd_sm.set_enable(false);
 
@@ -340,35 +370,34 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.cmd_sm.set_enable(true);
     }
 
+    /// reads cmd bits from sm into buff
+    /// requires sm to be at exec to jmp to read state
     fn read_command(&mut self, buff: &mut [u8], response_len: CmdResponseLen) {
+        assert!(self.cmd_ready());
+
         // jmp to recv_bits and set bit counter to response_len
         let jmp_read = self.get_jmp(self.cmd_or_data_prg.state_receive_bits as u8);
         self.cmd_sm
             .tx()
             .push(jmp_read << 16 | response_len as u32 - 1);
 
-        match response_len {
-            CmdResponseLen::Short => {
-                assert!(buff.len() >= CmdResponseLen::Short as usize / 8);
+        assert!(buff.len() >= response_len as usize / 8);
 
-                // iterate in chunks of 32bits
-                for chunk in buff[0..6].chunks_mut(4) {
-                    let read = self.cmd_sm.rx().pull();
+        // iterate in chunks of 32bits
+        for chunk in buff[0..(response_len as usize / 8)].chunks_mut(4) {
+            let read = self.cmd_sm.rx().pull();
 
-                    chunk[0] = (read >> 24) as u8;
-                    chunk[1] = (read >> 16) as u8;
-                    if chunk.len() > 2 {
-                        chunk[2] = (read >> 8) as u8;
-                        chunk[3] = read as u8;
-                    }
-                }
+            chunk[0] = (read >> 24) as u8;
+            chunk[1] = (read >> 16) as u8;
+            if chunk.len() > 2 {
+                chunk[2] = (read >> 8) as u8;
+                chunk[3] = read as u8;
             }
-            CmdResponseLen::Long => todo!(),
         }
 
         // push remaining bits out of isr
-        let jmp_instruction = self.get_jmp(self.cmd_or_data_prg.state_inline_instruction as u8);
-        let push_inst = Instruction {
+        let jmp_instr = self.get_jmp(self.cmd_or_data_prg.state_inline_instruction as u8);
+        let push_instr = Instruction {
             operands: pio::program::InstructionOperands::PUSH {
                 if_full: false,
                 block: false,
@@ -378,7 +407,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         };
         self.cmd_sm
             .tx()
-            .push(jmp_instruction << 16 | push_inst.encode(SideSet::default()) as u32);
+            .push(jmp_instr << 16 | push_instr.encode(SideSet::default()) as u32);
 
         // set cmd pin back as output and wait for next state
         let jmp_wait_high = self.get_jmp(self.cmd_or_data_prg.no_arg_state_wait_high as u8);
@@ -401,9 +430,11 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
     /// checks if sm is at a exec instruction and ready to jmp to next state
     fn cmd_ready(&mut self) -> bool {
-        self.cmd_sm.get_addr() as u32 == self.cmd_or_data_prg.no_arg_state_waiting_for_cmd
-            || self.cmd_sm.get_addr() as u32 == self.cmd_or_data_prg.state_inline_instruction
-            || self.cmd_sm.get_addr() as u32 == self.cmd_or_data_prg.state_inline_instruction + 2
+        let pc = self.cmd_sm.get_addr() as u32;
+        // info!("CMD PC: {}", pc);
+        pc == self.cmd_or_data_prg.no_arg_state_waiting_for_cmd
+            || pc == self.cmd_or_data_prg.state_inline_instruction
+            || pc == self.cmd_or_data_prg.state_inline_instruction + 1
                 && self.cmd_sm.tx().empty()
                 && self.cmd_sm.rx().empty()
     }
@@ -414,6 +445,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.cmd_sm.clear_fifos();
         self.cmd_sm.restart();
         self.cmd_sm.set_enable(true);
+        while !self.cmd_ready() {}
     }
 
     /// resets data pio sm when in an unknown state or is stuck
@@ -458,10 +490,15 @@ impl Delay {
     ///
     /// Returns Ok(()) if still within deadline, or Err(()) if expired.
     fn check(&self) -> Result<(), ()> {
-        if Instant::now() > self.deadline {
+        if Instant::now() >= self.deadline {
             Err(())
         } else {
             Ok(())
         }
+    }
+
+    /// Delay ultil timeout has been hit
+    fn delay(&self) {
+        while self.check().is_err() {}
     }
 }
