@@ -7,11 +7,13 @@ use embassy_rp::pio::{
     ShiftConfig, ShiftDirection, StateMachine,
 };
 use embassy_rp::{PeripheralRef, into_ref};
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::delay::DelayNs;
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::sdcard::{AcquireOpts, CardType, Error};
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+
+const INIT_CLK: u32 = 200_000;
 
 pub struct PioSd<
     'd,
@@ -64,13 +66,21 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
     /// ensure cmd pio is ready otherwise return timeout and reset
     fn cmd_delay_ready(&mut self, delay: &mut Delay) -> Result<(), Error> {
-        while !self.inner.cmd_ready() {
-            if delay.check().is_err() {
-                self.inner.reset_cmd();
-                return Err(Error::Transport);
-            };
+        let mut stable_ready_count = 0;
+
+        while delay.check().is_ok() {
+            if self.inner.cmd_ready() {
+                stable_ready_count += 1;
+                if stable_ready_count > 3 {
+                    return Ok(());
+                }
+            } else {
+                stable_ready_count = 0;
+            }
         }
-        Ok(())
+
+        self.inner.reset_cmd();
+        Err(Error::Transport)
     }
 
     /// perform a command
@@ -107,9 +117,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             }
         }
 
-        info!("Good");
         self.cmd_delay_ready(&mut delay)?;
-        info!("bad");
 
         Ok(ERROR_OK)
     }
@@ -133,14 +141,16 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         trace!("Reset card..");
 
         // Sleep for initial clocks (74+)
-        Delay::new(1000).delay();
+        Delay::new(Duration::from_hz(INIT_CLK.into()) * 74).delay();
 
         for attempts in 1..self.options.acquire_retries {
             trace!("Enter SD mode, attempt: {}", attempts);
             match self.card_command(CMD0, 0) {
-                Err(Error::TimeoutCommand(CMD0)) => {
+                Err(Error::Transport) => {
+                    warn!("Transport reset, trying again..");
+                }
+                Err(Error::TimeoutCommand(_)) => {
                     warn!("Timed out, trying again..");
-                    self.inner.reset_cmd();
                 }
                 Err(e) => {
                     return Err(e);
@@ -156,7 +166,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             if attempts == self.options.acquire_retries {
                 Err(Error::CardNotFound)?
             }
-            Delay::new(10);
+            Delay::new(Duration::from_millis(10));
         }
 
         // // Check voltage
@@ -285,8 +295,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         dma: C,
     ) -> Self {
         into_ref!(dma);
-        let freq = 200_000;
-        let div = (clk_sys_freq() / freq) as u16;
+        let div = (clk_sys_freq() / INIT_CLK) as u16;
 
         // Clk program config
         let clk = pio.make_pio_pin(clk_pin);
@@ -444,6 +453,10 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.cmd_sm.set_enable(false);
         self.cmd_sm.clear_fifos();
         self.cmd_sm.restart();
+        unsafe {
+            self.cmd_sm
+                .exec_jmp(self.cmd_or_data_prg.no_arg_state_wait_high as u8)
+        };
         self.cmd_sm.set_enable(true);
         while !self.cmd_ready() {}
     }
@@ -453,7 +466,12 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.data_sm.set_enable(false);
         self.data_sm.clear_fifos();
         self.data_sm.restart();
+        unsafe {
+            self.data_sm
+                .exec_jmp(self.cmd_or_data_prg.no_arg_state_wait_high as u8)
+        };
         self.data_sm.set_enable(true);
+        // while !self.data_ready() {}
     }
 }
 
@@ -471,26 +489,23 @@ struct Delay {
 }
 
 impl Delay {
-    /// How long to wait for a response, in microseconds (e.g. 100ms).
-    const DEFAULT_COMMAND_TIMEOUT_US: u64 = 100_000;
-
     /// Create a new Delay object with a custom timeout in microseconds.
-    fn new(timeout_us: u64) -> Self {
+    fn new(timeout: Duration) -> Self {
         Self {
-            deadline: Instant::now() + embassy_time::Duration::from_micros(timeout_us),
+            deadline: Instant::now().checked_add(timeout).unwrap(),
         }
     }
 
     /// Create a Delay for standard command waiting (~100ms).
     fn new_command() -> Self {
-        Self::new(Self::DEFAULT_COMMAND_TIMEOUT_US)
+        Self::new(Duration::from_millis(100))
     }
 
     /// Check if we are still within the allowed timeout period.
     ///
     /// Returns Ok(()) if still within deadline, or Err(()) if expired.
     fn check(&self) -> Result<(), ()> {
-        if Instant::now() >= self.deadline {
+        if Instant::now() > self.deadline {
             Err(())
         } else {
             Ok(())
