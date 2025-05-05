@@ -16,6 +16,7 @@ use embassy_rp::pio::{
 use embassy_rp::{Peripheral, bind_interrupts, into_ref};
 use embassy_time::Timer;
 use embedded_sdmmc::sdcard::AcquireOpts;
+use embedded_sdmmc::sdcard::proto::{CMD0, CMD8};
 use {defmt_rtt as _, panic_probe as _};
 
 mod sd;
@@ -56,6 +57,9 @@ async fn main(_spawner: Spawner) {
     );
 
     sd.check_init().unwrap();
+    //
+    // let _ = sd.card_command(CMD0, 0, false);
+    // unwrap!(sd.card_command(CMD8, 0x1AA, true));
 
     info!("Done!");
 
