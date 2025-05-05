@@ -55,7 +55,7 @@ async fn main(_spawner: Spawner) {
         AcquireOpts::default(),
     );
 
-    sd.acquire().unwrap();
+    sd.check_init().unwrap();
 
     info!("Done!");
 

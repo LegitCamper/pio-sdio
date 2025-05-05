@@ -1,6 +1,7 @@
 use defmt::{debug, expect, info, trace, unwrap, warn};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::{Channel, Transfer};
+use embassy_rp::gpio::Pull;
 use embassy_rp::pio::program::{Instruction, Program, SideSet, pio_asm};
 use embassy_rp::pio::{
     self, Common, Direction, FifoJoin, Instance, InterruptHandler, LoadedProgram, Pio, PioPin,
@@ -13,7 +14,7 @@ use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::sdcard::{AcquireOpts, CardType, Error};
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 
-const INIT_CLK: u32 = 200_000;
+const INIT_CLK: u32 = 100_000;
 
 pub struct PioSd<
     'd,
@@ -111,15 +112,9 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         // let (cmd_idx, cmd_status) = self.parse_cmd_response(&buf)?;
         // info!("RX idx: {:X}, status: {:#04X}", cmd_idx, cmd_status);
 
-        for byte in read {
-            if (byte & 0x80) == ERROR_OK {
-                return Ok(byte);
-            }
-        }
-
         self.cmd_delay_ready(&mut delay)?;
 
-        Ok(ERROR_OK)
+        Ok(read[0])
     }
 
     fn parse_cmd_response(&self, buf: &[u8]) -> Result<(u8, u32), Error> {
@@ -134,7 +129,18 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         Ok((command_index, status))
     }
 
-    pub fn acquire(&mut self) -> Result<(), Error> {
+    /// Check the card is initialised.
+    pub fn check_init(&mut self) -> Result<(), Error> {
+        if self.card_type.is_none() {
+            // If we don't know what the card type is, try and initialise the
+            // card. This will tell us what type of card it is.
+            self.acquire()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn acquire(&mut self) -> Result<(), Error> {
         debug!("acquiring card with opts: {:?}", self.options);
 
         // let mut card_type;
@@ -166,7 +172,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             if attempts == self.options.acquire_retries {
                 Err(Error::CardNotFound)?
             }
-            Delay::new(Duration::from_millis(10));
+            Delay::new(Duration::from_hz(INIT_CLK.into()) * 8).delay();
         }
 
         // // Check voltage
@@ -298,7 +304,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let div = (clk_sys_freq() / INIT_CLK) as u16;
 
         // Clk program config
-        let clk = pio.make_pio_pin(clk_pin);
+        let mut clk = pio.make_pio_pin(clk_pin);
+        clk.set_pull(Pull::Down);
         let mut clk_cfg = pio::Config::default();
         clk_cfg.use_program(&clk_prg.clk, &[&clk]);
         clk_cfg.clock_divider = div.into();
@@ -313,7 +320,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         };
 
         // Cmd config
-        let cmd = pio.make_pio_pin(cmd_pin);
+        let mut cmd = pio.make_pio_pin(cmd_pin);
+        cmd.set_pull(Pull::Up);
         let mut cmd_cfg = pio::Config::default();
         cmd_cfg.use_program(&cmd_or_data_prg.cmd_or_data, &[]);
         cmd_cfg.set_set_pins(&[&cmd]);
@@ -327,7 +335,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         cmd_sm.set_enable(true);
 
         // Data config
-        let d0 = pio.make_pio_pin(d0_pin);
+        let mut d0 = pio.make_pio_pin(d0_pin);
+        d0.set_pull(Pull::Up);
         let mut data_cfg = pio::Config::default();
         data_cfg.use_program(&cmd_or_data_prg.cmd_or_data, &[]);
         data_cfg.set_set_pins(&[&d0]);
@@ -383,6 +392,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     /// requires sm to be at exec to jmp to read state
     fn read_command(&mut self, buff: &mut [u8], response_len: CmdResponseLen) {
         assert!(self.cmd_ready());
+        assert!(buff.len() >= response_len as usize / 8);
 
         // jmp to recv_bits and set bit counter to response_len
         let jmp_read = self.get_jmp(self.cmd_or_data_prg.state_receive_bits as u8);
@@ -390,11 +400,10 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             .tx()
             .push(jmp_read << 16 | response_len as u32 - 1);
 
-        assert!(buff.len() >= response_len as usize / 8);
-
         // iterate in chunks of 32bits
         for chunk in buff[0..(response_len as usize / 8)].chunks_mut(4) {
             let read = self.cmd_sm.rx().pull();
+            info!("Read {:#02X}", read);
 
             chunk[0] = (read >> 24) as u8;
             chunk[1] = (read >> 16) as u8;
