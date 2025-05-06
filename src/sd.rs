@@ -15,6 +15,9 @@ use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 
 const INIT_CLK: u32 = 100_000;
 
+// Request voltage information
+const CMD5: u8 = 0x05;
+
 pub struct PioSd<
     'd,
     PIO: Instance,
@@ -117,7 +120,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             // let (cmd_idx, cmd_status) = self.parse_cmd_response(&buf)?;
             // info!("RX idx: {:X}, status: {:#04X}", cmd_idx, cmd_status);
 
-            self.cmd_delay_ready(&mut delay)?;
+            self.cmd_delay_ready(&mut delay)
+                .map_err(|_| Error::TimeoutCommand(command))?;
             info!("RX: {:#04X}", read[..response as usize / 8]);
 
             return Ok(read[0]);
@@ -152,36 +156,41 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     fn acquire(&mut self) -> Result<(), Error> {
         debug!("acquiring card with opts: {:?}", self.options);
 
-        // let mut card_type;
         trace!("Reset card..");
-        let card_type;
-
+        let mut card_type;
         let _ = self.card_command(CMD0, 0, None);
 
-        // Check card version
+        // get card version
         let arg = loop {
-            let status = unwrap!(self.card_command(CMD8, 0x1AA, Some(CmdResponseLen::Short)));
-            if status == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
+            let resp = unwrap!(self.card_command(CMD8, 0x1AA, Some(CmdResponseLen::Short)));
+            if resp == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
                 card_type = CardType::SD1;
                 break 0;
-            } else if status == 0xAA || status == 0xA8 {
+            } else if resp == 0xAA {
                 card_type = CardType::SD2;
-                break 0x4000_0000;
+                break 1 << 30;
             }
             Delay::new(Duration::from_millis(10)).delay();
         };
 
-        // App command
-        unwrap!(self.card_command(CMD55, 0, Some(CmdResponseLen::Short)));
+        // Delay::new(Duration::from_millis(10)).delay();
 
-        // the card's initialization process
-        unwrap!(self.card_command(ACMD41, 0x4000_0000, Some(CmdResponseLen::Short)));
+        // // Loop sending ACMD41 until card leaves idle
+        // for _ in 0..100 {
+        //     self.card_command(CMD55, 0, Some(CmdResponseLen::Short))?;
 
-        // unwrap!(self.card_command(0x02, 0, Some(CmdResponseLen::Long)));
+        //     let resp = self.card_command(ACMD41, arg, Some(CmdResponseLen::Short))?;
+        //     if (resp & R1_IDLE_STATE) == 0 {
+        //         break;
+        //     }
 
-        // let rca_resp = unwrap!(self.card_command(0x03, 0, Some(CmdResponseLen::Short)));
-        // let rca = (rca_resp as u16) << 8 | (rca_resp as u16); // depends on how your response bytes are arranged
-        // info!("RCA: {}", rca);
+        //     Delay::new(Duration::from_millis(50)).delay();
+        // }
+
+        // Optional: CMD58 to check OCR — useful, but can skip if you're only initializing SD
+        // Optional: CMD2, CMD3, etc.
+
+        info!("Card initialized: {:?}", card_type);
 
         Ok(())
     }
@@ -383,6 +392,28 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         )
     }
 
+    fn make_sdio_cmd(cmd: u8, arg: u32) -> u64 {
+        assert!(cmd < 64);
+        let mut bits = 0u64;
+
+        bits |= 0b01 << 46; // Start bit (0) + Tx bit (1)
+        bits |= (cmd as u64) << 40;
+        bits |= (arg as u64) << 8;
+
+        let mut buf = [0u8; 5];
+        buf[0] = 0b01 << 6 | cmd; // First byte: start + tx + cmd
+        buf[1] = (arg >> 24) as u8;
+        buf[2] = (arg >> 16) as u8;
+        buf[3] = (arg >> 8) as u8;
+        buf[4] = arg as u8;
+
+        let crc = crc7(&buf);
+        bits |= (crc as u64) << 1;
+        bits |= 1; // Stop bit
+
+        bits
+    }
+
     /// writes cmd to sm
     /// requires sm to be at exec to jmp to write state
     fn write_command(&mut self, upper: u32, lower: u16) {
@@ -416,6 +447,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         // iterate in chunks of 32bits for 48 or 148 bits
         for chunk in buff[0..(response_len as usize / 8)].chunks_mut(4) {
             let read = self.cmd_sm.rx().pull();
+            info!("READ: {:032b}", read);
 
             chunk[0] = (read >> 24) as u8;
             if chunk.len() > 1 {
