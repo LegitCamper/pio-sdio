@@ -3,9 +3,11 @@
 #![feature(impl_trait_in_assoc_type)]
 
 use core::borrow::BorrowMut;
-use defmt::info;
+use defmt::{expect, info, unwrap};
 use embassy_executor::Spawner;
 use embassy_rp::clocks::clk_sys_freq;
+use embassy_rp::dma::Channel;
+use embassy_rp::gpio::Output;
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::program::pio_asm;
 use embassy_rp::pio::{
@@ -13,10 +15,12 @@ use embassy_rp::pio::{
 };
 use embassy_rp::{Peripheral, bind_interrupts, into_ref};
 use embassy_time::Timer;
+use embedded_sdmmc::sdcard::AcquireOpts;
+use embedded_sdmmc::sdcard::proto::{CMD0, CMD8};
 use {defmt_rtt as _, panic_probe as _};
 
 mod sd;
-use sd::{PioSd, PioSdPrograms};
+use sd::{PioSd, PioSdClk, PioSdCmdData};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -31,25 +35,33 @@ async fn main(_spawner: Spawner) {
         sm0,
         sm1,
         sm2,
-        sm3,
+        irq0,
         ..
     } = Pio::new(p.PIO0, Irqs);
 
-    let programs = PioSdPrograms::new(&mut common);
-    let mut sd = PioSd::new_1_bit(
-        &mut common,
-        sm0,
-        sm1,
-        sm2,
-        sm3,
+    let cmd_data_prg = PioSdCmdData::new(&mut common);
+    let clk_prg = PioSdClk::new(&mut common);
+    let mut sd = PioSd::new(
         p.PIN_2,
         p.PIN_3,
         p.PIN_4,
-        programs,
+        clk_prg,
+        cmd_data_prg,
+        &mut common,
+        irq0,
+        sm0,
+        sm1,
+        sm2,
         p.DMA_CH0,
+        AcquireOpts::default(),
     );
 
-    info!("Done!!!");
+    sd.check_init().unwrap();
+    //
+    // let _ = sd.card_command(CMD0, 0, false);
+    // unwrap!(sd.card_command(CMD8, 0x1AA, true));
+
+    info!("Done!");
 
     loop {}
 }

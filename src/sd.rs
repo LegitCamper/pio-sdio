@@ -1,86 +1,22 @@
+use defmt::{debug, expect, info, trace, unwrap, warn};
 use embassy_rp::clocks::clk_sys_freq;
-use embassy_rp::dma::{Channel, Transfer};
-use embassy_rp::pio::program::pio_asm;
+use embassy_rp::dma::Channel;
+use embassy_rp::gpio::Pull;
+use embassy_rp::pio::program::{Instruction, Program, SideSet, pio_asm};
 use embassy_rp::pio::{
     self, Common, Direction, FifoJoin, Instance, InterruptHandler, LoadedProgram, Pio, PioPin,
     ShiftConfig, ShiftDirection, StateMachine,
 };
 use embassy_rp::{PeripheralRef, into_ref};
-use embassy_time::Timer;
+use embassy_time::{Duration, Instant, Timer};
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::sdcard::{AcquireOpts, CardType, Error};
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 
-pub struct PioSdPrograms<'d, PIO: Instance> {
-    clk: LoadedProgram<'d, PIO>,
-    cmd: LoadedProgram<'d, PIO>,
-    oneb_tx: LoadedProgram<'d, PIO>,
-    oneb_rx: LoadedProgram<'d, PIO>,
-}
+const INIT_CLK: u32 = 100_000;
 
-impl<'d, PIO: Instance> PioSdPrograms<'d, PIO> {
-    /// Loads 23 instructions into pio, and uses 4 state machines
-    pub fn new(common: &mut Common<'d, PIO>) -> Self {
-        let clk = pio_asm!(
-            ".side_set 1",
-            "irq 0 side 1",
-            "irq clear 0 side 0",
-            options(max_program_size = 2)
-        );
-
-        // the lower half of the second word sent needs to contain the length of the response
-        let cmd = pio_asm!(
-            ".side_set 1 opt pindirs",
-            "out y, 32", // Store 47 in y (for write loop)
-            ".wrap_target",
-            // Write CMD
-            "mov x, y          side 1", // (re)set counter, set cmd as output
-            "wait 0 irq 0",
-            "lp_write:",
-            "out pins, 1",
-            "jmp x-- lp_write",
-            // Read CMD
-            "out x, 16        side 0", // move counter to x (47 or 135), set cmd as input
-            "wait 0 irq 0",
-            "lp_read:",
-            "in pins, 1",
-            "jmp x-- lp_read",
-            "push", // push remaining 16 bits from isr
-            ".wrap",
-            options(max_program_size = 10)
-        );
-
-        // before data can be written, length of data in bits, needs to be pushed
-        let oneb_tx = pio_asm!(
-            "set pins, 1", // idle high
-            "out x, 32",   // stall waiting for data len
-            "set pindirs, 1",
-            "wait 0 irq 0", // sync clk
-            "loop:",
-            "out pins, 1",
-            "jmp x-- loop",
-            options(max_program_size = 7)
-        );
-
-        // requires sm to be stopped when not reading to avoid conflicts with tx
-        let oneb_rx = pio_asm!(
-            "set pindirs, 0",
-            "wait 0 pin, 0", // wait until DAT goes low (start bit)
-            "wait 1 irq 0",  // sync clk
-            "loop:",
-            "in pins, 1",
-            "jmp loop",
-            options(max_program_size = 5)
-        );
-
-        Self {
-            clk: common.load_program(&clk.program),
-            cmd: common.load_program(&cmd.program),
-            oneb_tx: common.load_program(&oneb_tx.program),
-            oneb_rx: common.load_program(&oneb_rx.program),
-        }
-    }
-}
+// Request voltage information
+const CMD5: u8 = 0x05;
 
 pub struct PioSd<
     'd,
@@ -89,258 +25,555 @@ pub struct PioSd<
     const SM0: usize,
     const SM1: usize,
     const SM2: usize,
-    const SM3: usize,
 > {
-    pub dma: PeripheralRef<'d, C>,
-    pub cfg: pio::Config<'d, PIO>,
-    pub clk_sm: StateMachine<'d, PIO, SM0>,
-    pub cmd_sm: StateMachine<'d, PIO, SM1>,
-    pub tx_sm: StateMachine<'d, PIO, SM2>,
-    pub rx_sm: StateMachine<'d, PIO, SM3>,
+    pub inner: PioSdInner<'d, PIO, C, SM0, SM1, SM2>,
+    card_type: Option<CardType>,
+    options: AcquireOpts,
 }
 
-impl<
+impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM2: usize>
+    PioSd<'d, PIO, C, SM0, SM1, SM2>
+{
+    pub fn new(
+        clk_pin: impl PioPin,
+        cmd_pin: impl PioPin,
+        d0_pin: impl PioPin,
+        clk_prg: PioSdClk<'d, PIO>,
+        cmd_or_data_prg: PioSdCmdData<'d, PIO>,
+        pio: &mut Common<'d, PIO>,
+        clk_irq: pio::Irq<'d, PIO, 0>,
+        clk_sm: StateMachine<'d, PIO, SM0>,
+        cmd_sm: StateMachine<'d, PIO, SM1>,
+        data_sm: StateMachine<'d, PIO, SM2>,
+        dma: C,
+        options: AcquireOpts,
+    ) -> Self {
+        Self {
+            options,
+            card_type: None,
+            inner: PioSdInner::new(
+                clk_pin,
+                cmd_pin,
+                d0_pin,
+                clk_prg,
+                cmd_or_data_prg,
+                pio,
+                clk_irq,
+                clk_sm,
+                cmd_sm,
+                data_sm,
+                dma,
+            ),
+        }
+    }
+
+    /// ensure cmd pio is ready otherwise return timeout and reset
+    fn cmd_delay_ready(&mut self, delay: &mut Delay) -> Result<(), Error> {
+        let mut stable_ready_count = 0;
+
+        while delay.check().is_ok() {
+            if self.inner.cmd_ready() {
+                stable_ready_count += 1;
+                if stable_ready_count > 3 {
+                    return Ok(());
+                }
+            } else {
+                stable_ready_count = 0;
+            }
+        }
+
+        self.inner.reset_cmd();
+        Err(Error::Transport)
+    }
+
+    /// perform a command
+    pub fn card_command(
+        &mut self,
+        command: u8,
+        arg: u32,
+        response: Option<CmdResponseLen>,
+    ) -> Result<u8, Error> {
+        let mut delay = Delay::new_command();
+
+        let mut buf = [
+            0x40 | command,
+            (arg >> 24) as u8,
+            (arg >> 16) as u8,
+            (arg >> 8) as u8,
+            arg as u8,
+            0,
+        ];
+        buf[5] = crc7(&buf[0..5]);
+
+        self.cmd_delay_ready(&mut delay)?;
+
+        let cmd = self.inner.buf_to_cmd(&buf);
+        self.inner.write_command(cmd.0, cmd.1);
+
+        self.cmd_delay_ready(&mut delay)?;
+        info!("Tx: {:#04X}", buf);
+
+        if let Some(response) = response {
+            let mut read = [0; CmdResponseLen::Long as usize];
+            self.inner
+                .read_command(&mut read[..response as usize / 8], response);
+            // let (cmd_idx, cmd_status) = self.parse_cmd_response(&buf)?;
+            // info!("RX idx: {:X}, status: {:#04X}", cmd_idx, cmd_status);
+
+            self.cmd_delay_ready(&mut delay)
+                .map_err(|_| Error::TimeoutCommand(command))?;
+            info!("RX: {:#04X}", read[..response as usize / 8]);
+
+            return Ok(read[0]);
+        }
+
+        Ok(0)
+    }
+
+    fn parse_cmd_response(&self, buf: &[u8]) -> Result<(u8, u32), Error> {
+        assert!(buf.len() == 6);
+
+        let command_index = (buf[0] >> 2) & 0x3F; // 6 bits
+        let status = ((buf[1] as u32) << 24)
+            | ((buf[2] as u32) << 16)
+            | ((buf[3] as u32) << 8)
+            | (buf[4] as u32);
+
+        Ok((command_index, status))
+    }
+
+    /// Check the card is initialised.
+    pub fn check_init(&mut self) -> Result<(), Error> {
+        if self.card_type.is_none() {
+            // If we don't know what the card type is, try and initialise the
+            // card. This will tell us what type of card it is.
+            self.acquire()
+        } else {
+            Ok(())
+        }
+    }
+
+    fn acquire(&mut self) -> Result<(), Error> {
+        debug!("acquiring card with opts: {:?}", self.options);
+
+        trace!("Reset card..");
+        let mut card_type;
+        let _ = self.card_command(CMD0, 0, None);
+
+        // get card version
+        let arg = loop {
+            let resp = unwrap!(self.card_command(CMD8, 0x1AA, Some(CmdResponseLen::Short)));
+            if resp == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
+                card_type = CardType::SD1;
+                break 0;
+            } else if resp == 0xAA {
+                card_type = CardType::SD2;
+                break 1 << 30;
+            }
+            Delay::new(Duration::from_millis(10)).delay();
+        };
+
+        // Delay::new(Duration::from_millis(10)).delay();
+
+        // // Loop sending ACMD41 until card leaves idle
+        // for _ in 0..100 {
+        //     self.card_command(CMD55, 0, Some(CmdResponseLen::Short))?;
+
+        //     let resp = self.card_command(ACMD41, arg, Some(CmdResponseLen::Short))?;
+        //     if (resp & R1_IDLE_STATE) == 0 {
+        //         break;
+        //     }
+
+        //     Delay::new(Duration::from_millis(50)).delay();
+        // }
+
+        // Optional: CMD58 to check OCR — useful, but can skip if you're only initializing SD
+        // Optional: CMD2, CMD3, etc.
+
+        info!("Card initialized: {:?}", card_type);
+
+        Ok(())
+    }
+}
+
+pub struct PioSdClk<'d, PIO: Instance> {
+    clk: LoadedProgram<'d, PIO>,
+}
+
+impl<'d, PIO: Instance> PioSdClk<'d, PIO> {
+    pub fn new(common: &mut Common<'d, PIO>) -> Self {
+        let clk_prg = pio_asm!(".side_set 1", "irq 0 side 1", "irq clear 0 side 0",);
+        let clk = common.load_program(&clk_prg.program);
+        Self { clk }
+    }
+}
+
+pub struct PioSdCmdData<'d, PIO: Instance> {
+    cmd_or_data: LoadedProgram<'d, PIO>,
+    no_arg_state_wait_high: u8,
+    no_arg_state_waiting_for_cmd: u8,
+    state_send_bits: u8,
+    state_inline_instruction: u8,
+    state_receive_bits: u8,
+}
+
+impl<'d, PIO: Instance> PioSdCmdData<'d, PIO> {
+    pub fn new(common: &mut Common<'d, PIO>) -> Self {
+        // This is a dual purpose program for both cmd and data
+        // source: https://github.com/raspberrypi/pico-extras/blob/master/src/rp2_common/pico_sd_card/sd_card.pio
+        // opted to exclude 4-bit mode for quick testing
+        let cmd_or_data_prg = pio_asm!(
+            r#"
+                .origin 0 ; must load at zero (offsets are hardcoded in instruction stream)
+                public no_arg_state_wait_high:      ; this is a no arg state which means it must always appear in the second half of a word
+                    ; make sure pins are hi when we set output dir ( avoid pin glitch/accidental start bit )
+                    set pins, 1
+                    set pindirs, 1 
+                
+                public no_arg_state_waiting_for_cmd:
+                    out exec, 16                    ; expected to be a jmp to a state
+                
+                public state_send_bits:
+                    out x, 16
+                    wait 0 irq 0
+                slp:
+                    out pins, 1
+                    jmp x-- slp
+                
+                public state_inline_instruction:
+                    out exec, 16                     ; may be any instruction
+                .wrap_target
+                    out exec, 16                     ; expected to be a jmp to a state
+                
+                public state_receive_bits:
+                    out x, 16
+                    set pindirs, 0
+                    wait 1 pin, 0
+                    wait 0 pin, 0
+                    wait 0 irq 0
+                    ; note we use wrap setup to configure receive bit/nibble transfers
+                rlp:
+                    in pins, 1
+                    jmp x-- rlp
+                .wrap
+            "#,
+        );
+        let cmd_or_data = common.load_program(&cmd_or_data_prg.program);
+
+        Self {
+            cmd_or_data,
+            no_arg_state_wait_high: cmd_or_data_prg.public_defines.no_arg_state_wait_high as u8,
+            no_arg_state_waiting_for_cmd: cmd_or_data_prg
+                .public_defines
+                .no_arg_state_waiting_for_cmd as u8,
+            state_send_bits: cmd_or_data_prg.public_defines.state_send_bits as u8,
+            state_inline_instruction: cmd_or_data_prg.public_defines.state_inline_instruction as u8,
+            state_receive_bits: cmd_or_data_prg.public_defines.state_receive_bits as u8,
+        }
+    }
+}
+
+pub struct PioSdInner<
     'd,
     PIO: Instance,
     C: Channel,
     const SM0: usize,
     const SM1: usize,
     const SM2: usize,
-    const SM3: usize,
-> PioSd<'d, PIO, C, SM0, SM1, SM2, SM3>
+> {
+    dma: PeripheralRef<'d, C>,
+    clk_irq: pio::Irq<'d, PIO, 0>,
+    clk_cfg: pio::Config<'d, PIO>,
+    clk_sm: StateMachine<'d, PIO, SM0>,
+    cmd_or_data_prg: PioSdCmdData<'d, PIO>,
+    cmd_cfg: pio::Config<'d, PIO>,
+    cmd_sm: StateMachine<'d, PIO, SM1>,
+    data_cfg: pio::Config<'d, PIO>,
+    data_sm: StateMachine<'d, PIO, SM2>,
+}
+
+impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM2: usize>
+    PioSdInner<'d, PIO, C, SM0, SM1, SM2>
 {
-    pub fn new_1_bit(
-        pio: &mut Common<'d, PIO>,
-        mut clk_sm: StateMachine<'d, PIO, SM0>,
-        mut cmd_sm: StateMachine<'d, PIO, SM1>,
-        mut tx_sm: StateMachine<'d, PIO, SM2>,
-        mut rx_sm: StateMachine<'d, PIO, SM3>,
+    pub fn new(
         clk_pin: impl PioPin,
         cmd_pin: impl PioPin,
         d0_pin: impl PioPin,
-        programs: PioSdPrograms<'d, PIO>,
+        clk_prg: PioSdClk<'d, PIO>,
+        cmd_or_data_prg: PioSdCmdData<'d, PIO>,
+        pio: &mut Common<'d, PIO>,
+        clk_irq: pio::Irq<'d, PIO, 0>,
+        mut clk_sm: StateMachine<'d, PIO, SM0>,
+        mut cmd_sm: StateMachine<'d, PIO, SM1>,
+        mut data_sm: StateMachine<'d, PIO, SM2>,
         dma: C,
     ) -> Self {
         into_ref!(dma);
-        let div = (clk_sys_freq() / 400_000) as u16;
+        let div = (clk_sys_freq() / INIT_CLK) as u16;
 
         // Clk program config
-        let clk = pio.make_pio_pin(clk_pin);
-        let mut cfg = pio::Config::default();
-        cfg.use_program(&programs.clk, &[&clk]);
-        cfg.clock_divider = div.into();
-        clk_sm.set_config(&cfg);
+        let mut clk = pio.make_pio_pin(clk_pin);
+        clk.set_pull(Pull::Down);
+        let mut clk_cfg = pio::Config::default();
+        clk_cfg.use_program(&clk_prg.clk, &[&clk]);
+        clk_cfg.clock_divider = div.into();
+        clk_sm.set_config(&clk_cfg);
         clk_sm.set_pin_dirs(Direction::Out, &[&clk]);
         clk_sm.set_enable(true);
 
-        // Cmd program config
-        let cmd = pio.make_pio_pin(cmd_pin);
-        let mut cfg = pio::Config::default();
-        cfg.use_program(&programs.cmd, &[&cmd]);
-        cfg.set_out_pins(&[&cmd]);
-        cfg.set_in_pins(&[&cmd]);
-        cfg.clock_divider = div.into();
+        let shift_cfg = ShiftConfig {
+            threshold: 32,
+            direction: ShiftDirection::Left,
+            auto_fill: true,
+        };
 
-        let mut shift_cfg = ShiftConfig::default();
-        shift_cfg.threshold = 32;
-        shift_cfg.direction = ShiftDirection::Left;
-        shift_cfg.auto_fill = true;
-        cfg.shift_out = shift_cfg;
-        cfg.shift_in = shift_cfg;
-
-        cmd_sm.set_config(&cfg);
+        // Cmd config
+        let mut cmd = pio.make_pio_pin(cmd_pin);
+        cmd.set_pull(Pull::Up);
+        let mut cmd_cfg = pio::Config::default();
+        cmd_cfg.use_program(&cmd_or_data_prg.cmd_or_data, &[]);
+        cmd_cfg.set_set_pins(&[&cmd]);
+        cmd_cfg.set_out_pins(&[&cmd]);
+        cmd_cfg.set_in_pins(&[&cmd]);
+        cmd_cfg.clock_divider = div.into();
+        cmd_cfg.shift_in = shift_cfg;
+        cmd_cfg.shift_out = shift_cfg;
+        cmd_sm.set_config(&cmd_cfg);
         cmd_sm.clear_fifos();
-        cmd_sm.tx().push(47); // write loop counter
-        cmd_sm.set_enable(true);
+        // cmd_sm.set_enable(true);
+        unsafe { cmd_sm.exec_jmp(cmd_or_data_prg.no_arg_state_wait_high) };
 
-        let d0 = pio.make_pio_pin(d0_pin);
+        // Data config
+        let mut d0 = pio.make_pio_pin(d0_pin);
+        d0.set_pull(Pull::Up);
+        let mut data_cfg = pio::Config::default();
+        data_cfg.use_program(&cmd_or_data_prg.cmd_or_data, &[]);
+        data_cfg.set_set_pins(&[&d0]);
+        data_cfg.set_out_pins(&[&d0]);
+        data_cfg.set_in_pins(&[&d0]);
+        data_cfg.clock_divider = div.into();
+        data_cfg.shift_in = shift_cfg;
+        data_cfg.shift_out = shift_cfg;
+        data_sm.set_config(&data_cfg);
+        data_sm.clear_fifos();
+        // data_sm.set_enable(true);
+        unsafe { cmd_sm.exec_jmp(cmd_or_data_prg.no_arg_state_waiting_for_cmd) };
 
-        // Tx program config
-        let mut cfg = pio::Config::default();
-        cfg.use_program(&programs.oneb_tx, &[]);
-        cfg.set_out_pins(&[&d0]);
-        cfg.set_set_pins(&[&d0]);
-        cfg.clock_divider = div.into();
-        cfg.fifo_join = FifoJoin::TxOnly;
-        let mut shift_cfg = ShiftConfig::default();
-        shift_cfg.threshold = 32;
-        shift_cfg.direction = ShiftDirection::Left;
-        shift_cfg.auto_fill = true;
-        cfg.shift_in = shift_cfg;
-        tx_sm.set_config(&cfg);
-        tx_sm.clear_fifos();
-        tx_sm.set_enable(true);
-
-        // Rx program config
-        let mut cfg = pio::Config::default();
-        cfg.use_program(&programs.oneb_rx, &[]);
-        cfg.set_in_pins(&[&d0]);
-        cfg.set_set_pins(&[&d0]);
-        cfg.clock_divider = div.into();
-        cfg.fifo_join = FifoJoin::RxOnly;
-        let mut shift_cfg = ShiftConfig::default();
-        shift_cfg.threshold = 32;
-        shift_cfg.direction = ShiftDirection::Left;
-        shift_cfg.auto_fill = true;
-        cfg.shift_in = shift_cfg;
-        rx_sm.set_config(&cfg);
-        rx_sm.clear_fifos();
-        rx_sm.set_enable(false);
+        let jmp = Self::get_jmp(cmd_or_data_prg.state_send_bits);
+        cmd_sm.tx().push((jmp as u32) << 16 | 80 - 1);
+        cmd_sm.tx().push(0xffffffff);
+        cmd_sm.tx().push(0xffffffff);
+        cmd_sm
+            .tx()
+            .push(0xffff0000 | Self::get_jmp(cmd_or_data_prg.no_arg_state_wait_high) as u32);
+        pio.apply_sm_batch(|_| {
+            cmd_sm.set_enable(true);
+            data_sm.set_enable(true);
+        });
 
         Self {
             dma,
-            cfg,
+            clk_irq,
+            clk_cfg,
             clk_sm,
+            cmd_or_data_prg,
+            cmd_cfg,
             cmd_sm,
-            tx_sm,
-            rx_sm,
+            data_cfg,
+            data_sm,
         }
     }
 
-    /// Will change the pio frequency and restart the state machine and clear any fifos.
-    /// DONT use while any communication is occurring
-    pub fn set_freq(&mut self, freq: u32) {
-        self.cfg.clock_divider = ((clk_sys_freq() / freq) as u16).into();
-        self.clk_sm.restart();
+    fn buf_to_cmd(&self, buf: &[u8]) -> (u32, u16) {
+        assert!(buf.len() == 6);
+        (
+            (buf[0] as u32) << 24 | (buf[1] as u32) << 16 | (buf[2] as u32) << 8 | buf[3] as u32,
+            (buf[4] as u16) << 8 | buf[5] as u16,
+        )
+    }
+
+    fn make_sdio_cmd(cmd: u8, arg: u32) -> u64 {
+        assert!(cmd < 64);
+        let mut bits = 0u64;
+
+        bits |= 0b01 << 46; // Start bit (0) + Tx bit (1)
+        bits |= (cmd as u64) << 40;
+        bits |= (arg as u64) << 8;
+
+        let mut buf = [0u8; 5];
+        buf[0] = 0b01 << 6 | cmd; // First byte: start + tx + cmd
+        buf[1] = (arg >> 24) as u8;
+        buf[2] = (arg >> 16) as u8;
+        buf[3] = (arg >> 8) as u8;
+        buf[4] = arg as u8;
+
+        let crc = crc7(&buf);
+        bits |= (crc as u64) << 1;
+        bits |= 1; // Stop bit
+
+        bits
+    }
+
+    /// writes cmd to sm
+    /// requires sm to be at exec to jmp to write state
+    fn write_command(&mut self, upper: u32, lower: u16) {
+        assert!(self.cmd_ready());
+
+        // disable sm to avoid sm stall after first word is read and losing clk
+        self.cmd_sm.set_enable(false);
+
+        // jmp to send_bits and set bit counter to 48 bits
+        let jmp_send = Self::get_jmp(self.cmd_or_data_prg.state_send_bits);
+        self.cmd_sm.tx().push((jmp_send as u32) << 16 | 48 - 1);
+
+        self.cmd_sm.tx().push(upper);
+        self.cmd_sm.tx().push((lower as u32) << 16);
+
+        self.cmd_sm.set_enable(true);
+    }
+
+    /// reads cmd bits from sm into buff
+    /// requires sm to be at exec to jmp to read state
+    fn read_command(&mut self, buff: &mut [u8], response_len: CmdResponseLen) {
+        assert!(self.cmd_ready());
+        assert!(buff.len() >= response_len as usize / 8);
+
+        // jmp to recv_bits and set bit counter to response_len
+        let jmp_read = Self::get_jmp(self.cmd_or_data_prg.state_receive_bits);
+        self.cmd_sm
+            .tx()
+            .push((jmp_read as u32) << 16 | response_len as u32 - 1);
+
+        // iterate in chunks of 32bits for 48 or 148 bits
+        for chunk in buff[0..(response_len as usize / 8)].chunks_mut(4) {
+            let read = self.cmd_sm.rx().pull();
+            info!("READ: {:032b}", read);
+
+            chunk[0] = (read >> 24) as u8;
+            if chunk.len() > 1 {
+                chunk[1] = (read >> 16) as u8;
+            }
+            if chunk.len() > 2 {
+                chunk[2] = (read >> 8) as u8;
+            }
+            if chunk.len() > 3 {
+                chunk[3] = read as u8;
+            }
+        }
+        self.cmd_sm.clear_fifos();
+
+        // push remaining bits out of isr if bit len is not div 32
+        if response_len as u32 & 32 != 0 {
+            let jmp_instr = Self::get_jmp(self.cmd_or_data_prg.state_inline_instruction);
+            let null_instr = Instruction {
+                operands: pio::program::InstructionOperands::IN {
+                    source: pio::program::InSource::NULL,
+                    bit_count: 32 - (response_len as u8 & 31),
+                },
+                delay: 0,
+                side_set: None,
+            };
+            self.cmd_sm
+                .tx()
+                .push((jmp_instr as u32) << 16 | null_instr.encode(SideSet::default()) as u32);
+        }
+
+        // set cmd pin back as output and wait for next state
+        let jmp_instr = Self::get_jmp(self.cmd_or_data_prg.state_inline_instruction) as u32;
+        let jmp_wait_high = Self::get_jmp(self.cmd_or_data_prg.no_arg_state_wait_high) as u32;
+        self.cmd_sm.tx().push(jmp_instr << 16 | jmp_wait_high);
+    }
+
+    /// create a jmp exec instruction to an address
+    fn get_jmp(addr: u8) -> u8 {
+        let jmp = Instruction {
+            operands: pio::program::InstructionOperands::JMP {
+                condition: pio::program::JmpCondition::Always,
+                address: addr,
+            },
+            delay: 0,
+            side_set: None,
+        };
+        jmp.encode(SideSet::default()) as u8
+    }
+
+    /// checks if sm is at a exec instruction and ready to jmp to next state
+    fn cmd_ready(&mut self) -> bool {
+        let pc = self.cmd_sm.get_addr();
+        // info!("CMD PC: {}", pc);
+        pc == self.cmd_or_data_prg.no_arg_state_waiting_for_cmd
+            || pc == self.cmd_or_data_prg.state_inline_instruction
+            || pc == self.cmd_or_data_prg.state_inline_instruction + 1
+                && self.cmd_sm.tx().empty()
+                && self.cmd_sm.rx().empty()
+    }
+
+    /// resets cmd pio sm when in an unknown state or is stuck
+    fn reset_cmd(&mut self) {
+        self.cmd_sm.set_enable(false);
+        self.cmd_sm.clear_fifos();
         self.cmd_sm.restart();
-        self.tx_sm.restart();
-        self.rx_sm.restart();
-        self.cmd_sm.tx().push(47);
+        unsafe {
+            self.cmd_sm
+                .exec_jmp(self.cmd_or_data_prg.no_arg_state_wait_high)
+        };
+        self.cmd_sm.set_enable(true);
+        while !self.cmd_ready() {}
     }
 
-    /// Spin until the card returns 0xFF, or we spin too many times and
-    /// timeout.
-    fn wait_not_busy(&mut self, mut delay: Delay) -> Result<(), Error> {
-        loop {
-            let s = self.read_cmd()?;
-            if s == 0xFF {
-                break;
-            }
-            delay.delay(&mut self.delayer, Error::TimeoutWaitNotBusy)?;
-        }
-        Ok(())
-    }
-
-    /// writes command
-    fn write_cmd(&mut self, command: u8, arg: u32) -> Result<u8, Error> {
-        // assert!(cmd.len() == 2);
-
-        // // write 2 cmd words
-        // self.cmd_sm.tx().push(cmd[0]); // first 32 bits of cmd
-        // self.cmd_sm.tx().push(((cmd[1]) << 16) | response as u32); // last 16 bits of cmd + response len
-        //
-    }
-
-    fn read_cmd(&mut self, buff: &mut [u32]) {
-        for b in buff.iter_mut() {
-            if let Some(word) = self.cmd_sm.rx().try_pull() {
-                *b = word
-            } else {
-                return;
-            }
-        }
-    }
-
-    // write single byte to bus
-    fn write_word<'b>(&'b mut self, word: u32) {
-        self.tx_sm.tx().push(31);
-        while self.tx_sm.tx().full() {}
-        self.tx_sm.tx().push(word);
-    }
-
-    // read single byte from bus
-    fn read_word<'b>(&'b mut self) -> u32 {
-        self.rx_sm.clear_fifos();
-        self.rx_sm.restart();
-        self.rx_sm.set_enable(true);
-
-        while self.rx_sm.rx().empty() {}
-        self.rx_sm.rx().pull()
-    }
-
-    /// Return an in-prograss dma transfer future. Awaiting it will guarantee a complete transfer.
-    fn write<'b>(&'b mut self, buff: &'b [u32]) -> Transfer<'b, C> {
-        self.tx_sm.tx().push(buff.len() as u32 * 31);
-        self.tx_sm.tx().dma_push(self.dma.reborrow(), buff, false)
-    }
-
-    /// Return an in-prograss dma transfer future. Awaiting it will guarantee a complete transfer.
-    fn read<'b>(&'b mut self, buff: &'b mut [u32]) -> Transfer<'b, C> {
-        self.rx_sm.clear_fifos();
-        self.rx_sm.restart();
-        self.rx_sm.set_enable(true);
-
-        self.rx_sm.rx().dma_pull(self.dma.reborrow(), buff, false)
+    /// resets data pio sm when in an unknown state or is stuck
+    fn reset_data(&mut self) {
+        self.data_sm.set_enable(false);
+        self.data_sm.clear_fifos();
+        self.data_sm.restart();
+        unsafe {
+            self.data_sm
+                .exec_jmp(self.cmd_or_data_prg.no_arg_state_wait_high)
+        };
+        self.data_sm.set_enable(true);
+        // while !self.data_ready() {}
     }
 }
 
-/// This an object you can use to busy-wait with a timeout.
-///
-/// Will let you call `delay` up to `max_retries` times before `delay` returns
-/// an error.
+// number of bits for cmd responses
+#[derive(Copy, Clone)]
+enum CmdResponseLen {
+    Short = 48,
+    Long = 136,
+}
+
+/// This is a timer-based object you can use to enforce a timeout
+/// when waiting for SDIO card responses.
 struct Delay {
-    retries_left: u32,
+    deadline: Instant,
 }
 
 impl Delay {
-    /// The default number of retries for a read operation.
-    ///
-    /// At ~10us each this is ~100ms.
-    ///
-    /// See `Part1_Physical_Layer_Simplified_Specification_Ver9.00-1.pdf` Section 4.6.2.1
-    pub const DEFAULT_READ_RETRIES: u32 = 10_000;
-
-    /// The default number of retries for a write operation.
-    ///
-    /// At ~10us each this is ~500ms.
-    ///
-    /// See `Part1_Physical_Layer_Simplified_Specification_Ver9.00-1.pdf` Section 4.6.2.2
-    pub const DEFAULT_WRITE_RETRIES: u32 = 50_000;
-
-    /// The default number of retries for a control command.
-    ///
-    /// At ~10us each this is ~100ms.
-    ///
-    /// No value is given in the specification, so we pick the same as the read timeout.
-    pub const DEFAULT_COMMAND_RETRIES: u32 = 10_000;
-
-    /// Create a new Delay object with the given maximum number of retries.
-    fn new(max_retries: u32) -> Delay {
-        Delay {
-            retries_left: max_retries,
+    /// Create a new Delay object with a custom timeout in microseconds.
+    fn new(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now().checked_add(timeout).unwrap(),
         }
     }
 
-    /// Create a new Delay object with the maximum number of retries for a read operation.
-    fn new_read() -> Delay {
-        Delay::new(Self::DEFAULT_READ_RETRIES)
+    /// Create a Delay for standard command waiting (~100ms).
+    fn new_command() -> Self {
+        Self::new(Duration::from_millis(100))
     }
 
-    /// Create a new Delay object with the maximum number of retries for a write operation.
-    fn new_write() -> Delay {
-        Delay::new(Self::DEFAULT_WRITE_RETRIES)
-    }
-
-    /// Create a new Delay object with the maximum number of retries for a command operation.
-    fn new_command() -> Delay {
-        Delay::new(Self::DEFAULT_COMMAND_RETRIES)
-    }
-
-    /// Wait for a while.
+    /// Check if we are still within the allowed timeout period.
     ///
-    /// Checks the retry counter first, and if we hit the max retry limit, the
-    /// value `err` is returned. Otherwise we wait for 10us and then return
-    /// `Ok(())`.
-    fn delay<T>(&mut self, delayer: &mut T, err: Error) -> Result<(), Error>
-    where
-        T: embedded_hal::delay::DelayNs,
-    {
-        if self.retries_left == 0 {
-            Err(err)
+    /// Returns Ok(()) if still within deadline, or Err(()) if expired.
+    fn check(&self) -> Result<(), ()> {
+        if Instant::now() > self.deadline {
+            Err(())
         } else {
-            delayer.delay_us(10);
-            self.retries_left -= 1;
             Ok(())
         }
+    }
+
+    /// Delay ultil timeout has been hit
+    fn delay(&self) {
+        while self.check().is_err() {}
     }
 }
