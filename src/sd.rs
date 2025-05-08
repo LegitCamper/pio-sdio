@@ -13,7 +13,7 @@ use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::sdcard::{AcquireOpts, CardType, Error};
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 
-const INIT_CLK: u32 = 100_000;
+const INIT_CLK: u32 = 200_000;
 
 pub struct PioSd<
     'd,
@@ -36,7 +36,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         cmd_pin: impl PioPin,
         d0_pin: impl PioPin,
         clk_prg: PioSdClk<'d, PIO>,
-        cmd_or_data_prg: PioSd1bit<'d, PIO>,
+        one_bit_prog: PioSd1bit<'d, PIO>,
         pio: &mut Common<'d, PIO>,
         clk_irq: pio::Irq<'d, PIO, 0>,
         clk_sm: StateMachine<'d, PIO, SM0>,
@@ -53,7 +53,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 cmd_pin,
                 d0_pin,
                 clk_prg,
-                cmd_or_data_prg,
+                one_bit_prog,
                 pio,
                 clk_irq,
                 clk_sm,
@@ -86,6 +86,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         info!("Tx: {:#04X}", buf);
 
         if let Some(response) = response {
+            self.inner.reset_command();
             let mut read = [0; CmdResponseLen::Long as usize];
             self.inner
                 .read_command(&mut read[..response as usize / 8])?;
@@ -131,11 +132,13 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         trace!("Reset card..");
         let _ = self.card_command(CMD0, 0, None);
 
-        self.card_command(CMD8, 0x1AA, Some(CmdResponseLen::Short))?;
+        let _ = self.card_command(CMD8, 0x1AA, Some(CmdResponseLen::Short));
 
         // Loop sending ACMD41 until card leaves idle
         for _ in 0..100 {
-            self.card_command(CMD55, 0, Some(CmdResponseLen::Short))?;
+            if let Err(_) = self.card_command(CMD55, 0, Some(CmdResponseLen::Short)) {
+                continue;
+            }
 
             let resp = self.card_command(ACMD41, 0x400_000, Some(CmdResponseLen::Short))?;
             if (resp & R1_IDLE_STATE) == 0 {
@@ -178,16 +181,18 @@ impl<'d, PIO: Instance> PioSd1bit<'d, PIO> {
             // make sure pins are hi when we set output dir ( avoid pin glitch/accidental start bit )
             "set pins, 1",
             "set pindirs, 1",
+            ".wrap_target",
             "out x, 16",
             "wait 0 irq 0", // wait for clk
             "wlp:",
             "out pins, 1",
             "jmp x-- wlp",
+            ".wrap",
         );
 
         let read = pio_asm!(
-            "set pindirs, 0",
             "out x, 16",
+            "set pindirs, 0",
             "wait 1 pin, 0", // wait until card takes ownership
             "wait 0 pin, 0",
             "wait 0 irq 0", // wait for clk
@@ -243,6 +248,10 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         into_ref!(dma);
         let div = (clk_sys_freq() / INIT_CLK) as u16;
 
+        clk_sm.clear_fifos();
+        cmd_sm.clear_fifos();
+        data_sm.clear_fifos();
+
         let mut clk = pio.make_pio_pin(clk_pin);
         clk.set_pull(Pull::Down);
         let mut cmd = pio.make_pio_pin(cmd_pin);
@@ -254,9 +263,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let mut clk_cfg = pio::Config::default();
         clk_cfg.use_program(&clk_prg.clk, &[&clk]);
         clk_cfg.clock_divider = div.into();
-        clk_sm.set_config(&clk_cfg);
-        clk_sm.set_pin_dirs(Direction::Out, &[&clk]);
-        clk_sm.set_enable(true);
 
         let shift_cfg = ShiftConfig {
             threshold: 32,
@@ -295,6 +301,10 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         data_read_cfg.clock_divider = div.into();
         data_read_cfg.shift_out = shift_cfg;
         data_read_cfg.shift_in = shift_cfg;
+
+        clk_sm.set_config(&clk_cfg);
+        clk_sm.set_pin_dirs(Direction::Out, &[&clk]);
+        clk_sm.set_enable(true);
 
         // start write programs so pins are held high
         cmd_sm.set_config(&cmd_write_cfg);
@@ -349,17 +359,16 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     fn reset_command(&mut self) {
         self.cmd_sm.clear_fifos();
         self.cmd_sm.restart();
+        self.cmd_sm.set_config(&self.cmd_write_cfg);
     }
 
     /// writes cmd to sm
     fn write_command(&mut self, upper: u32, lower: u16) -> Result<(), Error> {
         self.cmd_sm.set_enable(false);
-        self.reset_command();
-        self.cmd_sm.set_config(&self.cmd_write_cfg);
 
         // packs command into two words with loop counter
         // commands are always 48 bits minus loop
-        self.cmd_sm.tx().push(48 - 1 | upper >> 16);
+        self.cmd_sm.tx().push((48 - 1 as u32) << 16 | upper >> 16);
         self.cmd_sm.tx().push(upper << 16 | lower as u32);
 
         self.cmd_sm.set_enable(true);
@@ -377,8 +386,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
     /// fills the entire buff with read bits
     pub fn read_command(&mut self, buff: &mut [u8]) -> Result<(), Error> {
-        self.cmd_sm.set_enable(false);
-        self.reset_command();
         self.cmd_sm.set_config(&self.cmd_read_cfg);
 
         // creates an exec instruction to flush bits left in isr
@@ -390,20 +397,19 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             delay: 0,
             side_set: None,
         };
-        let encoded_null = null_instr.encode(SideSet::new(false, 0, false));
 
         // set loop counter to the length of buff
-        self.cmd_sm
-            .tx()
-            .push(((buff.len() as u32 * 8) - 1) << 16 | encoded_null as u32);
-        self.cmd_sm.set_enable(true);
+        // and pack flush instruction
+        self.cmd_sm.tx().push(
+            ((buff.len() as u32 * 8) - 1) << 16 | null_instr.encode(SideSet::default()) as u32,
+        );
 
         let timeout = Delay::new_command();
-
         let mut i = 0;
+
         while i < buff.len() {
             if timeout.check().is_err() {
-                self.cmd_sm.clear_fifos();
+                self.reset_command();
                 return Err(Error::ReadError);
             }
 
@@ -426,8 +432,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             }
         }
 
-        self.reset_command();
-        self.cmd_sm.set_config(&self.cmd_write_cfg);
         Ok(())
     }
 }

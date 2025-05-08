@@ -39,8 +39,8 @@ async fn main(_spawner: Spawner) {
         ..
     } = Pio::new(p.PIO0, Irqs);
 
-    let one_bit_prg = PioSd1bit::new(&mut common);
     let clk_prg = PioSdClk::new(&mut common);
+    let one_bit_prg = PioSd1bit::new(&mut common);
     let mut sd = PioSd::new(
         p.PIN_2,
         p.PIN_3,
@@ -56,12 +56,12 @@ async fn main(_spawner: Spawner) {
         AcquireOpts::default(),
     );
 
-    // loop {
-    //     let _ = sd.check_init();
-    // }
+    loop {
+        let _ = sd.check_init();
+    }
     //
     //
-    let _ = sd.check_init();
+    //
 
     // loop {
     //     let mut buf = [0_u8; 4];
