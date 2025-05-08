@@ -56,9 +56,7 @@ async fn main(_spawner: Spawner) {
         AcquireOpts::default(),
     );
 
-    loop {
-        let _ = sd.check_init();
-    }
+    let _ = sd.check_init();
     //
     //
     //

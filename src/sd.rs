@@ -71,6 +71,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         arg: u32,
         response: Option<CmdResponseLen>,
     ) -> Result<u8, Error> {
+        self.inner.reset_command();
+
         let mut buf = [
             0x40 | command,
             (arg >> 24) as u8,
@@ -86,7 +88,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         info!("Tx: {:#04X}", buf);
 
         if let Some(response) = response {
-            self.inner.reset_command();
             let mut read = [0; CmdResponseLen::Long as usize];
             self.inner
                 .read_command(&mut read[..response as usize / 8])?;
@@ -127,6 +128,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         debug!("acquiring card with opts: {:?}", self.options);
 
         // Wait initial 74+ clocks high
+        self.inner.reset_command();
+        self.inner.cmd_sm.set_config(&self.inner.cmd_write_cfg);
         Delay::new(Duration::from_hz(INIT_CLK as u64) * 80).delay();
 
         trace!("Reset card..");
@@ -136,9 +139,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
         // Loop sending ACMD41 until card leaves idle
         for _ in 0..100 {
-            if let Err(_) = self.card_command(CMD55, 0, Some(CmdResponseLen::Short)) {
-                continue;
-            }
+            self.card_command(CMD55, 0, Some(CmdResponseLen::Short))?;
 
             let resp = self.card_command(ACMD41, 0x400_000, Some(CmdResponseLen::Short))?;
             if (resp & R1_IDLE_STATE) == 0 {
@@ -392,9 +393,10 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let null_instr = Instruction {
             operands: pio::program::InstructionOperands::IN {
                 source: pio::program::InSource::NULL,
-                bit_count: 32 - ((buff.len() as u8 * 8) % 31),
+                bit_count: 32 - ((buff.len() as u8 * 8) % 32),
             },
             delay: 0,
+
             side_set: None,
         };
 
@@ -405,30 +407,24 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         );
 
         let timeout = Delay::new_command();
-        let mut i = 0;
+        let mut bytes_written = 0;
 
-        while i < buff.len() {
+        while bytes_written < buff.len() {
             if timeout.check().is_err() {
                 self.reset_command();
                 return Err(Error::ReadError);
             }
 
             if let Some(read) = self.cmd_sm.rx().try_pull() {
-                info!("READ: {:032b}", read);
-
-                let remaining = &mut buff[i..];
-                remaining[0] = (read >> 24) as u8;
-                if remaining.len() > 1 {
-                    remaining[1] = (read >> 16) as u8;
+                trace!("READ: {:032b}", read);
+                for byte_index in 0..4 {
+                    if bytes_written < buff.len() {
+                        buff[bytes_written] = ((read >> (8 * (3 - byte_index))) as u8).swap_bytes();
+                        bytes_written += 1;
+                    } else {
+                        break;
+                    }
                 }
-                if remaining.len() > 2 {
-                    remaining[2] = (read >> 8) as u8;
-                }
-                if remaining.len() > 3 {
-                    remaining[3] = read as u8;
-                }
-
-                i += 4;
             }
         }
 
