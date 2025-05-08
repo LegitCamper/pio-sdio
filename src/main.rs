@@ -20,7 +20,7 @@ use embedded_sdmmc::sdcard::proto::{CMD0, CMD8};
 use {defmt_rtt as _, panic_probe as _};
 
 mod sd;
-use sd::{PioSd, PioSdClk, PioSdCmdData};
+use sd::{PioSd, PioSd1bit, PioSdClk};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -39,14 +39,14 @@ async fn main(_spawner: Spawner) {
         ..
     } = Pio::new(p.PIO0, Irqs);
 
-    let cmd_data_prg = PioSdCmdData::new(&mut common);
+    let one_bit_prg = PioSd1bit::new(&mut common);
     let clk_prg = PioSdClk::new(&mut common);
     let mut sd = PioSd::new(
         p.PIN_2,
         p.PIN_3,
         p.PIN_4,
         clk_prg,
-        cmd_data_prg,
+        one_bit_prg,
         &mut common,
         irq0,
         sm0,
@@ -56,10 +56,19 @@ async fn main(_spawner: Spawner) {
         AcquireOpts::default(),
     );
 
-    sd.check_init().unwrap();
+    // loop {
+    //     let _ = sd.check_init();
+    // }
     //
-    // let _ = sd.card_command(CMD0, 0, false);
-    // unwrap!(sd.card_command(CMD8, 0x1AA, true));
+    //
+    let _ = sd.check_init();
+
+    // loop {
+    //     let mut buf = [0_u8; 4];
+    //     let _ = sd.inner.read_command(&mut buf);
+    //     info!("Got: {:X}", buf);
+    //     Timer::after_millis(500).await;
+    // }
 
     info!("Done!");
 
