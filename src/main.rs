@@ -57,16 +57,7 @@ async fn main(_spawner: Spawner) {
     );
 
     let _ = sd.check_init();
-    //
-    //
-    //
-
-    // loop {
-    //     let mut buf = [0_u8; 4];
-    //     let _ = sd.inner.read_command(&mut buf);
-    //     info!("Got: {:X}", buf);
-    //     Timer::after_millis(500).await;
-    // }
+    unwrap!(sd.get_cid());
 
     info!("Done!");
 

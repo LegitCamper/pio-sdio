@@ -65,12 +65,12 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     /// perform a command
-    fn card_command(
-        &mut self,
-        command: u8,
-        arg: u32,
-        response: Option<CmdResponseLen>,
-    ) -> Result<u8, Error> {
+    fn card_command(&mut self, command: u8, arg: u32, read_buf: &mut [u8]) -> Result<(), Error> {
+        assert!(
+            read_buf.is_empty()
+                || read_buf.len() == CmdResponseLen::Short as usize / 8
+                || read_buf.len() == CmdResponseLen::Long as usize / 8
+        );
         self.inner.reset_command();
 
         let mut buf = [
@@ -87,18 +87,13 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.inner.write_command(cmd.0, cmd.1)?;
         info!("Tx: {:#04X}", buf);
 
-        if let Some(response) = response {
-            let mut read = [0; CmdResponseLen::Long as usize];
-            self.inner
-                .read_command(&mut read[..response as usize / 8])?;
-            // let (cmd_idx, cmd_status) = self.parse_cmd_response(&buf)?;
-            // info!("RX idx: {:X}, status: {:#04X}", cmd_idx, cmd_status);
-            info!("RX: {:#04X}", read[..response as usize / 8]);
-
-            return Ok(read[0]);
+        if !read_buf.is_empty() {
+            read_buf.iter_mut().for_each(|i| *i = 0);
+            self.inner.read_command(read_buf)?;
+            info!("RX: {:#04X}", read_buf);
         }
 
-        Ok(0)
+        Ok(())
     }
 
     fn parse_cmd_response(&self, buf: &[u8]) -> Result<(u8, u32), Error> {
@@ -127,32 +122,41 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     fn acquire(&mut self) -> Result<(), Error> {
         debug!("acquiring card with opts: {:?}", self.options);
 
+        let mut buf = [0_u8; CmdResponseLen::Short as usize / 8];
+
         // Wait initial 74+ clocks high
         self.inner.reset_command();
         self.inner.cmd_sm.set_config(&self.inner.cmd_write_cfg);
         Delay::new(Duration::from_hz(INIT_CLK as u64) * 80).delay();
 
         trace!("Reset card..");
-        let _ = self.card_command(CMD0, 0, None);
+        let _ = self.card_command(CMD0, 0, &mut []);
 
-        let _ = self.card_command(CMD8, 0x1AA, Some(CmdResponseLen::Short));
+        let _ = self.card_command(CMD8, 0x1AA, &mut buf);
 
         // Loop sending ACMD41 until card leaves idle
         for _ in 0..100 {
-            self.card_command(CMD55, 0, Some(CmdResponseLen::Short))?;
+            self.card_command(CMD55, 0, &mut buf)?;
 
-            let resp = self.card_command(ACMD41, 0x400_000, Some(CmdResponseLen::Short))?;
-            if (resp & R1_IDLE_STATE) == 0 {
+            self.card_command(ACMD41, 0, &mut buf)?;
+            if (buf[0] & R1_IDLE_STATE) == 0 {
+                info!("Card is Idle :)");
                 break;
             }
 
             Delay::new(Duration::from_millis(50)).delay();
         }
 
-        // Optional: CMD58 to check OCR — useful, but can skip if you're only initializing SD
-        // Optional: CMD2, CMD3, etc.
+        self.card_type = Some(CardType::SD1);
 
-        // info!("Card initialized: {:?}", card_type);
+        Ok(())
+    }
+
+    pub fn get_cid(&mut self) -> Result<(), Error> {
+        let mut buf = [0_u8; 17];
+        let _ = self.card_command(0x0A, 0, &mut buf)?;
+
+        info!("CID: {:X}", buf);
 
         Ok(())
     }
