@@ -56,7 +56,7 @@ async fn main(_spawner: Spawner) {
         AcquireOpts::default(),
     );
 
-    let _ = sd.check_init();
+    unwrap!(sd.check_init());
     unwrap!(sd.get_cid());
 
     info!("Done!");

@@ -1,19 +1,19 @@
-use defmt::{debug, expect, info, trace, unwrap, warn};
+use defmt::{debug, info, trace};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::Channel;
 use embassy_rp::gpio::Pull;
-use embassy_rp::pio::program::{Instruction, Program, SideSet, pio_asm};
+use embassy_rp::pio::program::{Instruction, SideSet, pio_asm};
 use embassy_rp::pio::{
-    self, Common, Direction, FifoJoin, Instance, InterruptHandler, LoadedProgram, Pio, PioPin,
-    ShiftConfig, ShiftDirection, StateMachine,
+    self, Common, Direction, Instance, LoadedProgram, PioPin, ShiftConfig, ShiftDirection,
+    StateMachine,
 };
 use embassy_rp::{PeripheralRef, into_ref};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant};
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::sdcard::{AcquireOpts, CardType, Error};
-use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+// use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 
-const INIT_CLK: u32 = 200_000;
+const INIT_CLK: u32 = 100_000;
 
 pub struct PioSd<
     'd,
@@ -96,18 +96,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         Ok(())
     }
 
-    fn parse_cmd_response(&self, buf: &[u8]) -> Result<(u8, u32), Error> {
-        assert!(buf.len() == 6);
-
-        let command_index = (buf[0] >> 2) & 0x3F; // 6 bits
-        let status = ((buf[1] as u32) << 24)
-            | ((buf[2] as u32) << 16)
-            | ((buf[3] as u32) << 8)
-            | (buf[4] as u32);
-
-        Ok((command_index, status))
-    }
-
     /// Check the card is initialised.
     pub fn check_init(&mut self) -> Result<(), Error> {
         if self.card_type.is_none() {
@@ -122,7 +110,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     fn acquire(&mut self) -> Result<(), Error> {
         debug!("acquiring card with opts: {:?}", self.options);
 
-        let mut buf = [0_u8; CmdResponseLen::Short as usize / 8];
+        let mut buf = [0xFF; CmdResponseLen::Short as usize / 8];
 
         // Wait initial 74+ clocks high
         self.inner.reset_command();
@@ -130,24 +118,32 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         Delay::new(Duration::from_hz(INIT_CLK as u64) * 80).delay();
 
         trace!("Reset card..");
-        let _ = self.card_command(CMD0, 0, &mut []);
+        let _ = self.card_command(CMD0, 0, &mut buf);
 
-        let _ = self.card_command(CMD8, 0x1AA, &mut buf);
+        self.card_command(CMD8, 0x1AA, &mut buf)?;
+        let (card_type, arg) = if buf[0] == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
+            (CardType::SD1, 0)
+        } else if buf[4] == 0xAA {
+            (CardType::SD2, 0x400_000)
+        } else {
+            (CardType::SD1, 0)
+        };
+
+        info!("Card Type: {}", card_type);
 
         // Loop sending ACMD41 until card leaves idle
         for _ in 0..100 {
-            self.card_command(CMD55, 0, &mut buf)?;
+            self.card_command(CMD55, arg, &mut buf)?;
 
             self.card_command(ACMD41, 0, &mut buf)?;
             if (buf[0] & R1_IDLE_STATE) == 0 {
-                info!("Card is Idle :)");
                 break;
             }
 
             Delay::new(Duration::from_millis(50)).delay();
         }
 
-        self.card_type = Some(CardType::SD1);
+        self.card_type = Some(card_type);
 
         Ok(())
     }
@@ -400,22 +396,19 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 bit_count: 32 - ((buff.len() as u8 * 8) % 32),
             },
             delay: 0,
-
             side_set: None,
         };
 
-        // set loop counter to the length of buff
-        // and pack flush instruction
-        self.cmd_sm.tx().push(
-            ((buff.len() as u32 * 8) - 1) << 16 | null_instr.encode(SideSet::default()) as u32,
-        );
+        let counter = (buff.len() as u32 * 8) - 1;
+        self.cmd_sm
+            .tx()
+            .push(counter << 16 | null_instr.encode(SideSet::default()) as u32);
 
         let timeout = Delay::new_command();
         let mut bytes_written = 0;
 
         while bytes_written < buff.len() {
             if timeout.check().is_err() {
-                self.reset_command();
                 return Err(Error::ReadError);
             }
 
@@ -423,7 +416,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 trace!("READ: {:032b}", read);
                 for byte_index in 0..4 {
                     if bytes_written < buff.len() {
-                        buff[bytes_written] = ((read >> (8 * (3 - byte_index))) as u8).swap_bytes();
+                        buff[bytes_written] = (read >> (8 * (3 - byte_index))) as u8;
                         bytes_written += 1;
                     } else {
                         break;
