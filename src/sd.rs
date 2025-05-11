@@ -1,14 +1,14 @@
 use defmt::{debug, info, trace};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::Channel;
-use embassy_rp::gpio::Pull;
+use embassy_rp::gpio::{Drive, Pull, SlewRate};
 use embassy_rp::pio::program::{Instruction, SideSet, pio_asm};
 use embassy_rp::pio::{
     self, Common, Direction, Instance, LoadedProgram, PioPin, ShiftConfig, ShiftDirection,
     StateMachine,
 };
 use embassy_rp::{PeripheralRef, into_ref};
-use embassy_time::{Duration, Instant};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::sdcard::{AcquireOpts, CardType, Error};
 // use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
@@ -108,8 +108,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     fn acquire(&mut self) -> Result<(), Error> {
-        debug!("acquiring card with opts: {:?}", self.options);
-
         let mut buf = [0xFF; CmdResponseLen::Short as usize / 8];
 
         // Wait initial 74+ clocks high
@@ -120,30 +118,26 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         trace!("Reset card..");
         let _ = self.card_command(CMD0, 0, &mut buf);
 
-        self.card_command(CMD8, 0x1AA, &mut buf)?;
-        let (card_type, arg) = if buf[0] == (R1_ILLEGAL_COMMAND | R1_IDLE_STATE) {
-            (CardType::SD1, 0)
-        } else if buf[4] == 0xAA {
-            (CardType::SD2, 0x400_000)
-        } else {
-            (CardType::SD1, 0)
+        let (card_type, arg) = match self.card_command(CMD8, 0x1AA, &mut buf) {
+            Ok(_) => {
+                assert!(buf[0] == 0b00001000); // matches command index
+                let voltage_bits = (buf[3] >> 0) & 0x0F;
+                if voltage_bits == 0x01 {
+                    (CardType::SD2, 0x40FF_8000)
+                } else {
+                    return Err(Error::TimeoutCommand(CMD8));
+                }
+            }
+            Err(_) => (CardType::SD1, 0),
         };
 
         info!("Card Type: {}", card_type);
-
-        // Loop sending ACMD41 until card leaves idle
-        for _ in 0..100 {
-            self.card_command(CMD55, arg, &mut buf)?;
-
-            self.card_command(ACMD41, 0, &mut buf)?;
-            if (buf[0] & R1_IDLE_STATE) == 0 {
-                break;
-            }
-
-            Delay::new(Duration::from_millis(50)).delay();
-        }
-
         self.card_type = Some(card_type);
+
+        Delay::new(Duration::from_millis(2)).delay();
+
+        self.card_command(CMD55, 0, &mut buf)?;
+        self.card_command(ACMD41, arg, &mut buf)?;
 
         Ok(())
     }
@@ -335,28 +329,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         )
     }
 
-    fn make_sdio_cmd(cmd: u8, arg: u32) -> u64 {
-        assert!(cmd < 64);
-        let mut bits = 0u64;
-
-        bits |= 0b01 << 46; // Start bit (0) + Tx bit (1)
-        bits |= (cmd as u64) << 40;
-        bits |= (arg as u64) << 8;
-
-        let mut buf = [0u8; 5];
-        buf[0] = 0b01 << 6 | cmd; // First byte: start + tx + cmd
-        buf[1] = (arg >> 24) as u8;
-        buf[2] = (arg >> 16) as u8;
-        buf[3] = (arg >> 8) as u8;
-        buf[4] = arg as u8;
-
-        let crc = crc7(&buf);
-        bits |= (crc as u64) << 1;
-        bits |= 1; // Stop bit
-
-        bits
-    }
-
     fn reset_command(&mut self) {
         self.cmd_sm.clear_fifos();
         self.cmd_sm.restart();
@@ -385,7 +357,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         Err(Error::WriteError)
     }
 
-    /// fills the entire buff with read bits
+    /// fills the entire buff with read bits from cmd line
     pub fn read_command(&mut self, buff: &mut [u8]) -> Result<(), Error> {
         self.cmd_sm.set_config(&self.cmd_read_cfg);
 
@@ -412,16 +384,20 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 return Err(Error::ReadError);
             }
 
+            let mut last_bit = 0;
             if let Some(read) = self.cmd_sm.rx().try_pull() {
-                trace!("READ: {:032b}", read);
+                // Save current MSB to carry into the next byte
+                let shifted = read >> 1 | last_bit << 31;
+                trace!("READ: {:032b}", shifted);
                 for byte_index in 0..4 {
                     if bytes_written < buff.len() {
-                        buff[bytes_written] = (read >> (8 * (3 - byte_index))) as u8;
+                        buff[bytes_written] = (shifted >> (8 * (3 - byte_index))) as u8;
                         bytes_written += 1;
                     } else {
                         break;
                     }
                 }
+                last_bit = read >> 31;
             }
         }
 
