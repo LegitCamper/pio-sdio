@@ -56,8 +56,8 @@ async fn main(_spawner: Spawner) {
         AcquireOpts::default(),
     );
 
-    unwrap!(sd.check_init());
-    unwrap!(sd.get_cid());
+    unwrap!(sd.check_init().await);
+    unwrap!(sd.get_cid().await);
 
     info!("Done!");
 
