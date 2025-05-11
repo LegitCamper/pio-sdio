@@ -136,31 +136,62 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         // Wait initial 74+ clocks high
         self.inner.reset_command();
         self.inner.cmd_sm.set_config(&self.inner.cmd_write_cfg);
-        Delay::new(Duration::from_hz(INIT_CLK as u64) * 80).delay();
+        Timer::after(Duration::from_hz(INIT_CLK as u64) * 100).await;
 
         trace!("Reset card..");
         self.card_command(CMD0, 0, &mut []).await?;
 
-        let (card_type, arg) = match self.card_command(CMD8, 0x1AA, &mut buf).await {
-            Ok(_) => {
-                // assert!(buf[0] == 0b00001000); // matches command index
-                let voltage_bits = (buf[3] >> 0) & 0x0F;
-                if voltage_bits == 0x01 {
-                    (CardType::SD2, 0x40FF_8000)
-                } else {
-                    return Err(Error::TimeoutCommand(CMD8));
+        let mut card_type = CardType::SD1;
+        let mut arg = 0;
+
+        for _ in 0..10 {
+            if let Ok(_) = self.card_command(CMD8, 0x1AA, &mut buf).await {
+                if buf[0] == 0x8 && buf[3] == 0x01 && buf[4] == 0xAA {
+                    card_type = CardType::SD2;
+                    arg = 0x40FF_8000;
+                    break;
                 }
+            } else {
+                // treat as SD1 for now, but retry
             }
-            Err(_) => (CardType::SD1, 0),
-        };
+
+            Timer::after_millis(50).await;
+        }
 
         info!("Card Type: {}", card_type);
         self.card_type = Some(card_type);
 
-        Delay::new(Duration::from_millis(2)).delay();
+        // if let Ok(_) = self.card_command(0x05, 0, &mut buf).await {
+        // } else {
+        //     info!("No CMD5 resp");
+        // }
 
-        self.card_command(CMD55, 0, &mut buf).await?;
-        self.card_command(ACMD41, arg, &mut buf).await?;
+        for i in 0..100 {
+            if let Err(_) = self.card_command(CMD55, 0, &mut buf).await {
+                continue;
+            }
+
+            if let Ok(_) = self.card_command(ACMD41, arg, &mut buf).await {
+                if buf[0] == 0x3F && buf[4] == 0x0 && buf[5] == 0xFF {
+                    if buf[1] & 0x40 == 0x40 {
+                        info!("Card is SDHC or SDHC!");
+                    }
+
+                    // check if card finished init or needs more time
+                    if buf[1] & 0x80 == 0x80 {
+                        break;
+                    }
+                }
+            }
+
+            if i + 1 == 100 {
+                return Err(Error::BadState);
+            }
+
+            Timer::after_millis(50).await;
+        }
+
+        info!("Success! Card should be initialized");
 
         Ok(())
     }
