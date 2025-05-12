@@ -54,9 +54,7 @@ async fn main(_spawner: Spawner) {
         Timer::after_millis(500).await;
     }
     unwrap!(sd.set_frequency(16_000_000).await);
-    unwrap!(sd.read_csd().await);
+    // unwrap!(sd.read_csd().await);
 
     info!("Done!");
-
-    loop {}
 }
