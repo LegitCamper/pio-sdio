@@ -153,7 +153,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
         // Wait initial 74+ clocks high
         self.inner.cmd_sm.set_config(&self.inner.cmd_write_cfg);
-        Timer::after(Duration::from_hz(INIT_CLK as u64) * 100).await;
+        Timer::after(Duration::from_hz(INIT_CLK as u64) * 80).await;
 
         trace!("Reset card..");
         self.card_command(CMD0, 0, &mut [], 0).await?;
@@ -174,49 +174,51 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                     break;
                 }
             }
+            Timer::after_millis(50).await;
+
             warn!("ERROR!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
         }
 
-        with_timeout(Duration::from_secs(1), async {
-            loop {
-                info!("Sending app");
-                if self
-                    .card_command(CMD55, 0, &mut buf, SHORT_CMD_RES)
-                    .await
-                    .is_err()
-                {
-                    Timer::after_millis(5).await;
-                    continue;
-                } else {
-                    info!("CMD55 RESP: {:X}", buf);
-                }
+        // with_timeout(Duration::from_secs(1), async {
+        //     loop {
+        //         info!("Sending app");
+        //         if self
+        //             .card_command(CMD55, 0, &mut buf, SHORT_CMD_RES)
+        //             .await
+        //             .is_err()
+        //         {
+        //             Timer::after_millis(5).await;
+        //             continue;
+        //         } else {
+        //             info!("CMD55 RESP: {:X}", buf);
+        //         }
 
-                info!("Sending init");
+        //         info!("Sending init");
 
-                if self
-                    .card_command(ACMD41, arg, &mut buf, SHORT_CMD_RES)
-                    .await
-                    .is_ok()
-                    && buf[0] == 0x3F
-                    && buf[4] == 0x0
-                    && buf[5] == 0xFF
-                {
-                    if buf[1] & 0x40 == 0x40 {
-                        info!("Card is SDHC or SDXC!");
-                        card_type = CardType::SDHC;
-                    }
-                    if buf[1] & 0x80 == 0x80 {
-                        break;
-                    };
-                    info!("Card is still initializing");
-                }
+        //         if self
+        //             .card_command(ACMD41, arg, &mut buf, SHORT_CMD_RES)
+        //             .await
+        //             .is_ok()
+        //             && buf[0] == 0x3F
+        //             && buf[4] == 0x0
+        //             && buf[5] == 0xFF
+        //         {
+        //             if buf[1] & 0x40 == 0x40 {
+        //                 info!("Card is SDHC or SDXC!");
+        //                 card_type = CardType::SDHC;
+        //             }
+        //             if buf[1] & 0x80 == 0x80 {
+        //                 break;
+        //             };
+        //             info!("Card is still initializing");
+        //         }
 
-                Timer::after_millis(5).await
-            }
-            info!("Broke timeout");
-        })
-        .await
-        .map_err(|_| Error::CardNotFound)?;
+        //         Timer::after_millis(5).await
+        //     }
+        //     info!("Broke timeout");
+        // })
+        // .await
+        // .map_err(|_| Error::CardNotFound)?;
 
         info!("Card Type: {}", card_type);
         self.card_type = Some(card_type);
@@ -258,18 +260,16 @@ impl<'d, PIO: Instance> PioSd1bit<'d, PIO> {
             // make sure pins are hi when we set output dir ( avoid pin glitch/accidental start bit )
             "set pins, 1",
             "set pindirs, 1",
-            ".wrap_target",
             "out x, 16",
             "wait 0 irq 0", // wait for clk
             "write_loop:",
             "out pins, 1",
             "jmp x-- write_loop",
-            ".wrap",
         );
 
         let read = pio_asm!(
             "out x, 16",
-            // "in null, 1", // preload start bit that is skip on `wait 0 pin, 0`
+            "in null, 1", // preload start bit that is skip on `wait 0 pin, 0`
             "set pindirs, 0",
             "wait 1 pin, 0", // wait until card takes ownership
             "wait 0 pin, 0",
@@ -483,50 +483,18 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             delay: 0,
             side_set: None,
         };
-        let counter = (buf.len() as u32 * 32) - 2; // - 1 bc start bit is prepended
 
         self.cmd_sm
             .tx()
-            .push(counter << 16 | null_instr.encode(SideSet::default()) as u32);
+            .push((bit_len as u32 - 2) << 16 | null_instr.encode(SideSet::default()) as u32);
 
-        // for chunk in buf.chunks_mut(4) {
-        //     let resp = self.cmd_sm.rx().wait_pull().await;
+        for chunk in buf.chunks_mut(4) {
+            let resp = self.cmd_sm.rx().wait_pull().await;
 
-        //     let bytes = resp.to_be_bytes();
-        //     for (i, b) in chunk.iter_mut().enumerate() {
-        //         *b = bytes[i];
-        //     }
-        // }
-
-        let mut dma_buf = [0_u32; 2];
-
-        self.cmd_sm
-            .rx()
-            .dma_pull(self.dma.reborrow(), &mut dma_buf, false)
-            .await;
-
-        let mut res = [0_u32; 2];
-        res[0] = self.cmd_sm.rx().wait_pull().await;
-        res[1] = self.cmd_sm.rx().wait_pull().await;
-
-        // prepends start bit to account for pio
-        let mut carry = 0u32;
-        for word in res.iter_mut() {
-            let new_carry = *word & 1;
-            *word = (*word >> 1) | (carry << 31);
-            carry = new_carry;
+            let bytes = resp.to_be_bytes();
+            for (i, b) in chunk.iter_mut().enumerate() {
+                *b = bytes[i];
+            }
         }
-
-        buf.chunks_mut(4)
-            .zip(dma_buf.iter())
-            .for_each(|(chunk, resp)| {
-                let resp = resp.to_le();
-                chunk[0] = (resp >> 24) as u8;
-                chunk[1] = (resp >> 16) as u8;
-                if chunk.len() > 2 {
-                    chunk[2] = (resp >> 8) as u8;
-                    chunk[3] = resp as u8;
-                }
-            });
     }
 }
