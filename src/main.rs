@@ -47,12 +47,15 @@ async fn main(_spawner: Spawner) {
     );
 
     loop {
-        if sd.check_init().await.is_ok() {
-            break;
+        loop {
+            if sd.check_init().await.is_ok() {
+                break;
+            }
+            warn!("Failed to acquire sd card, trying again...");
+            Timer::after_millis(500).await;
         }
-        warn!("Failed to acquire sd card, trying again...");
-        Timer::after_millis(500).await;
     }
+
     unwrap!(sd.set_frequency(16_000_000).await);
     // unwrap!(sd.read_csd().await);
 
