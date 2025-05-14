@@ -1,4 +1,4 @@
-use defmt::{debug, info, trace};
+use defmt::{debug, info, trace, warn};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::Channel;
 use embassy_rp::gpio::{Drive, Pull, SlewRate};
@@ -25,7 +25,6 @@ pub struct PioSd<
 > {
     pub inner: PioSdInner<'d, PIO, C, SM0, SM1, SM2>,
     card_type: Option<CardType>,
-    options: AcquireOpts,
 }
 
 impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM2: usize>
@@ -43,10 +42,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         cmd_sm: StateMachine<'d, PIO, SM1>,
         data_sm: StateMachine<'d, PIO, SM2>,
         dma: C,
-        options: AcquireOpts,
     ) -> Self {
         Self {
-            options,
             card_type: None,
             inner: PioSdInner::new_1_bit(
                 clk_pin,
@@ -65,12 +62,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     /// perform a command
-    async fn card_command(
-        &mut self,
-        command: u8,
-        arg: u32,
-        read_buf: &mut [u8],
-    ) -> Result<(), Error> {
+    fn card_command(&mut self, command: u8, arg: u32, read_buf: &mut [u8]) -> Result<(), Error> {
         assert!(
             read_buf.is_empty()
                 || read_buf.len() == CmdResponseLen::Short as usize / 8
@@ -88,32 +80,41 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         ];
         buf[5] = crc7(&buf[0..5]);
         let cmd = self.inner.buf_to_cmd(&buf);
-        self.inner.write_command(cmd.0, cmd.1)?;
+        self.inner.write_command(cmd.0, cmd.1);
+
+        let timeout = Delay::new(Duration::from_millis(2));
+        while timeout.check().is_ok() {
+            if self.inner.cmd_ready() {
+                break;
+            }
+        }
+        if timeout.check().is_err() {
+            self.inner.reset_command();
+            warn!("PIO write never completed before timeout");
+            return Err(Error::Transport);
+        }
         info!("Tx: {:#04X}", buf);
 
         if !read_buf.is_empty() {
-            let mut response = [0_u32; CmdResponseLen::Long as usize / 32];
-            let response = &mut response[..(read_buf.len() + 3) / 4];
             read_buf.iter_mut().for_each(|i| *i = 0);
-            self.inner
-                .read_command(response, read_buf.len() as u8 * 8)
-                .await?;
 
-            read_buf
-                .chunks_mut(4)
-                .zip(response.iter())
-                .for_each(|(read_chunk, resp)| {
-                    let resp = resp.to_le();
-                    read_chunk[0] = (resp >> 24) as u8;
-                    read_chunk[1] = (resp >> 16) as u8;
-                    if read_chunk.len() > 2 {
-                        read_chunk[2] = (resp >> 8) as u8;
-                        read_chunk[3] = resp as u8;
-                    }
-                });
+            self.inner.read_command(read_buf, read_buf.len() as u8 * 8);
+            let timeout = Delay::new_command();
+            while timeout.check().is_ok() {
+                if self.inner.cmd_ready() {
+                    break;
+                }
+            }
+            if timeout.check().is_err() {
+                self.inner.reset_command();
+                warn!("Pio failed to finish read");
+                Err(Error::TimeoutCommand(command))?
+            }
 
             info!("RX: {:#02X}", read_buf);
             info!("RXB: {:08b}", read_buf);
+
+            self.inner.reset_command(); // take ownership of cmd
         }
 
         Ok(())
@@ -139,13 +140,13 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         Timer::after(Duration::from_hz(INIT_CLK as u64) * 100).await;
 
         trace!("Reset card..");
-        self.card_command(CMD0, 0, &mut []).await?;
+        self.card_command(CMD0, 0, &mut [])?;
 
         let mut card_type = CardType::SD1;
         let mut arg = 0;
 
         for _ in 0..10 {
-            if let Ok(_) = self.card_command(CMD8, 0x1AA, &mut buf).await {
+            if let Ok(_) = self.card_command(CMD8, 0x1AA, &mut buf) {
                 if buf[0] == 0x8 && buf[3] == 0x01 && buf[4] == 0xAA {
                     card_type = CardType::SD2;
                     arg = 0x40FF_8000;
@@ -161,17 +162,12 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         info!("Card Type: {}", card_type);
         self.card_type = Some(card_type);
 
-        // if let Ok(_) = self.card_command(0x05, 0, &mut buf).await {
-        // } else {
-        //     info!("No CMD5 resp");
-        // }
-
         for i in 0..100 {
-            if let Err(_) = self.card_command(CMD55, 0, &mut buf).await {
+            if let Err(_) = self.card_command(CMD55, 0, &mut buf) {
                 continue;
             }
 
-            if let Ok(_) = self.card_command(ACMD41, arg, &mut buf).await {
+            if let Ok(_) = self.card_command(ACMD41, arg, &mut buf) {
                 if buf[0] == 0x3F && buf[4] == 0x0 && buf[5] == 0xFF {
                     if buf[1] & 0x40 == 0x40 {
                         info!("Card is SDHC or SDHC!");
@@ -198,7 +194,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
     pub async fn get_cid(&mut self) -> Result<(), Error> {
         let mut buf = [0_u8; 17];
-        let _ = self.card_command(0x0A, 0, &mut buf).await?;
+        let _ = self.card_command(0x0A, 0, &mut buf)?;
 
         info!("CID: {:X}", buf);
 
@@ -233,21 +229,22 @@ impl<'d, PIO: Instance> PioSd1bit<'d, PIO> {
             ".wrap_target",
             "out x, 16",
             "wait 0 irq 0", // wait for clk
-            "wlp:",
+            "write_loop:",
             "out pins, 1",
-            "jmp x-- wlp",
+            "jmp x-- write_loop",
             ".wrap",
         );
 
         let read = pio_asm!(
             "out x, 16",
+            "in null, 1", // preload start bit that is skipped on `wait 0 pin, 0`
             "set pindirs, 0",
             "wait 1 pin, 0", // wait until card takes ownership
             "wait 0 pin, 0",
             "wait 0 irq 0", // wait for clk
-            "rlp:",
+            "read_loop:",
             "in pins, 1",
-            "jmp x-- rlp",
+            "jmp x-- read_loop",
             "out exec, 16", // flush remaining bits in isr
         );
 
@@ -389,30 +386,28 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.cmd_sm.set_config(&self.cmd_write_cfg);
     }
 
+    fn cmd_ready(&mut self) -> bool {
+        self.cmd_sm.tx().stalled() && self.cmd_sm.tx().empty() && self.cmd_sm.rx().empty()
+    }
+
+    fn data_ready(&mut self) -> bool {
+        self.data_sm.tx().stalled() && self.data_sm.tx().empty() && self.data_sm.rx().empty()
+    }
+
     /// writes cmd to sm
-    fn write_command(&mut self, upper: u32, lower: u16) -> Result<(), Error> {
+    fn write_command(&mut self, upper: u32, lower: u16) {
         self.cmd_sm.set_enable(false);
 
         // packs command into two words with loop counter
         // commands are always 48 bits minus loop
-        self.cmd_sm.tx().push((48 - 1 as u32) << 16 | upper >> 16);
+        self.cmd_sm.tx().push((48_u32 - 1) << 16 | upper >> 16);
         self.cmd_sm.tx().push(upper << 16 | lower as u32);
 
         self.cmd_sm.set_enable(true);
-
-        let timeout = Delay::new_command();
-        while timeout.check().is_ok() {
-            // ensure words were written and sm is stalled
-            if self.cmd_sm.tx().empty() && self.cmd_sm.tx().stalled() {
-                return Ok(());
-            }
-        }
-
-        Err(Error::WriteError)
     }
 
-    // uses dma to fill buf with read words
-    pub async fn read_command(&mut self, buf: &mut [u32], bit_len: u8) -> Result<(), Error> {
+    // reads bit len into buf
+    pub fn read_command(&mut self, buf: &mut [u8], bit_len: u8) {
         self.cmd_sm.set_config(&self.cmd_read_cfg);
 
         // creates an exec instruction to flush bits left in isr
@@ -422,34 +417,24 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 bit_count: 32 - (bit_len % 32),
             },
             delay: 0,
-
             side_set: None,
         };
-        let counter = (buf.len() as u32 * 32) - 1;
-        // ignore exec instruction by leaving lower bits empty
         self.cmd_sm
             .tx()
-            .push(counter << 16 | null_instr.encode(SideSet::default()) as u32);
+            .push((bit_len as u32 - 1) << 16 | null_instr.encode(SideSet::default()) as u32);
 
-        with_timeout(
-            Duration::from_millis(50),
-            self.cmd_sm.rx().dma_pull(self.dma.reborrow(), buf, false),
-        )
-        .await
-        .map_err(|_| Error::ReadError)?;
-
-        // prepends start bit to account for pio
-        let mut carry = 0u32;
-        for word in buf.iter_mut() {
-            let new_carry = *word & 1;
-            *word = (*word >> 1) | (carry << 31);
-            carry = new_carry;
+        for chunk in buf.chunks_mut(4) {
+            loop {
+                if let Some(resp) = self.cmd_sm.rx().try_pull() {
+                    let bytes = resp.to_be_bytes();
+                    info!("READ!!! {:X}", resp);
+                    for (i, b) in chunk.iter_mut().enumerate() {
+                        *b = bytes[i];
+                    }
+                    break;
+                }
+            }
         }
-
-        // take ownership of cmd
-        self.cmd_sm.set_config(&self.cmd_write_cfg);
-
-        Ok(())
     }
 }
 
@@ -460,8 +445,7 @@ enum CmdResponseLen {
     Long = 136,
 }
 
-/// This is a timer-based object you can use to enforce a timeout
-/// when waiting for SDIO card responses.
+/// Blocking timer object for timeouts on time sensitive read/write(s)
 struct Delay {
     deadline: Instant,
 }
