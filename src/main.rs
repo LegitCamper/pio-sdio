@@ -2,21 +2,11 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use core::borrow::BorrowMut;
-use defmt::{expect, info, unwrap};
+use defmt::{info, unwrap};
 use embassy_executor::Spawner;
-use embassy_rp::clocks::clk_sys_freq;
-use embassy_rp::dma::Channel;
-use embassy_rp::gpio::Output;
+use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::PIO0;
-use embassy_rp::pio::program::pio_asm;
-use embassy_rp::pio::{
-    self, Direction, FifoJoin, InterruptHandler, Pio, ShiftConfig, ShiftDirection, StateMachine,
-};
-use embassy_rp::{Peripheral, bind_interrupts, into_ref};
-use embassy_time::Timer;
-use embedded_sdmmc::sdcard::AcquireOpts;
-use embedded_sdmmc::sdcard::proto::{CMD0, CMD8};
+use embassy_rp::pio::{InterruptHandler, Pio};
 use {defmt_rtt as _, panic_probe as _};
 
 mod sd;
@@ -59,6 +49,4 @@ async fn main(_spawner: Spawner) {
     unwrap!(sd.get_cid().await);
 
     info!("Done!");
-
-    loop {}
 }

@@ -1,7 +1,7 @@
-use defmt::{debug, info, trace};
+use defmt::{info, trace};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::Channel;
-use embassy_rp::gpio::{Drive, Pull, SlewRate};
+use embassy_rp::gpio::Pull;
 use embassy_rp::pio::program::{Instruction, SideSet, pio_asm};
 use embassy_rp::pio::{
     self, Common, Direction, Instance, LoadedProgram, PioPin, ShiftConfig, ShiftDirection,
@@ -10,10 +10,13 @@ use embassy_rp::pio::{
 use embassy_rp::{PeripheralRef, into_ref};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_sdmmc::sdcard::proto::*;
-use embedded_sdmmc::sdcard::{AcquireOpts, CardType, Error};
+use embedded_sdmmc::sdcard::{CardType, Error};
 // use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 
 const INIT_CLK: u32 = 100_000;
+
+const SHORT_CMD_RESP: u8 = 48;
+const LONG_CMD_RESP: u8 = 136;
 
 pub struct PioSd<
     'd,
@@ -70,8 +73,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     ) -> Result<(), Error> {
         assert!(
             read_buf.is_empty()
-                || read_buf.len() == CmdResponseLen::Short as usize / 8
-                || read_buf.len() == CmdResponseLen::Long as usize / 8
+                || read_buf.len() == SHORT_CMD_RESP as usize / 8
+                || read_buf.len() == LONG_CMD_RESP as usize / 8
         );
         self.inner.reset_command();
 
@@ -89,8 +92,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         info!("Tx: {:#04X}", buf);
 
         if !read_buf.is_empty() {
-            let mut response = [0_u32; CmdResponseLen::Long as usize / 32];
-            let response = &mut response[..(read_buf.len() + 3) / 4];
+            let mut response = [0_u32; LONG_CMD_RESP as usize / 32];
+            let response = &mut response[..read_buf.len().div_ceil(4)];
             read_buf.iter_mut().for_each(|i| *i = 0);
             self.inner
                 .read_command(
@@ -132,7 +135,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     async fn acquire(&mut self) -> Result<(), Error> {
-        let mut buf = [0xFF; CmdResponseLen::Short as usize / 8];
+        let mut buf = [0xFF; SHORT_CMD_RESP as usize / 8];
 
         // Wait initial 74+ clocks high
         self.inner.reset_command();
@@ -146,14 +149,14 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let mut arg = 0;
 
         for _ in 0..10 {
-            if let Ok(_) = self.card_command(CMD8, 0x1AA, &mut buf).await {
-                if buf[0] == 0x8 && buf[3] == 0x01 && buf[4] == 0xAA {
-                    card_type = CardType::SD2;
-                    arg = 0x40FF_8000;
-                    break;
-                }
-            } else {
-                // treat as SD1 for now, but retry
+            if self.card_command(CMD8, 0x1AA, &mut buf).await.is_ok()
+                && buf[0] == 0x8
+                && buf[3] == 0x01
+                && buf[4] == 0xAA
+            {
+                card_type = CardType::SD2;
+                arg = 0x40FF_8000;
+                break;
             }
 
             Timer::after_millis(50).await;
@@ -168,20 +171,22 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         // }
 
         for i in 0..100 {
-            if let Err(_) = self.card_command(CMD55, 0, &mut buf).await {
+            if self.card_command(CMD55, 0, &mut buf).await.is_err() {
                 continue;
             }
 
-            if let Ok(_) = self.card_command(ACMD41, arg, &mut buf).await {
-                if buf[0] == 0x3F && buf[4] == 0x0 && buf[5] == 0xFF {
-                    if buf[1] & 0x40 == 0x40 {
-                        info!("Card is SDHC or SDHC!");
-                    }
+            if self.card_command(ACMD41, arg, &mut buf).await.is_ok()
+                && buf[0] == 0x3F
+                && buf[4] == 0x0
+                && buf[5] == 0xFF
+            {
+                if buf[1] & 0x40 == 0x40 {
+                    info!("Card is SDHC or SDHC!");
+                }
 
-                    // check if card finished init or needs more time
-                    if buf[1] & 0x80 == 0x80 {
-                        break;
-                    }
+                // check if card finished init or needs more time
+                if buf[1] & 0x80 == 0x80 {
+                    break;
                 }
             }
 
@@ -199,7 +204,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
     pub async fn get_cid(&mut self) -> Result<(), Error> {
         let mut buf = [0_u8; 17];
-        let _ = self.card_command(0x0A, 0, &mut buf).await?;
+        self.card_command(0x0A, 0, &mut buf).await?;
 
         info!("CID: {:X}", buf);
 
@@ -397,12 +402,12 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
         // packs command into two words with loop counter
         // commands are always 48 bits minus loop
-        self.cmd_sm.tx().push((48 - 1 as u32) << 16 | upper >> 16);
+        self.cmd_sm.tx().push((48_u32 - 1) << 16 | upper >> 16);
         self.cmd_sm.tx().push(upper << 16 | lower as u32);
 
         self.cmd_sm.set_enable(true);
 
-        let timeout = Delay::new(Duration::from_millis(2));
+        let timeout = Timeout::new(Duration::from_millis(2));
         while timeout.check().is_ok() {
             // ensure words were written and sm is stalled
             if self.cmd_sm.tx().empty() && self.cmd_sm.tx().stalled() {
@@ -453,30 +458,18 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 }
 
-// number of bits for cmd responses
-#[derive(Copy, Clone)]
-enum CmdResponseLen {
-    Short = 48,
-    Long = 136,
-}
-
 /// This is a timer-based object you can use to enforce a timeout
 /// when waiting for SDIO card responses.
-struct Delay {
+struct Timeout {
     deadline: Instant,
 }
 
-impl Delay {
+impl Timeout {
     /// Create a new Delay object with a custom timeout in microseconds.
     fn new(timeout: Duration) -> Self {
         Self {
             deadline: Instant::now().checked_add(timeout).unwrap(),
         }
-    }
-
-    /// Create a Delay for standard command waiting (~100ms).
-    fn new_command() -> Self {
-        Self::new(Duration::from_millis(100))
     }
 
     /// Check if we are still within the allowed timeout period.
@@ -488,10 +481,5 @@ impl Delay {
         } else {
             Ok(())
         }
-    }
-
-    /// Delay ultil timeout has been hit
-    fn delay(&self) {
-        while self.check().is_err() {}
     }
 }
