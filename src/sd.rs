@@ -110,7 +110,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 .await?;
 
             info!("RX: {:#02X}", read_buf);
-            info!("RXB: {:08b}", read_buf);
         }
 
         Ok(())
@@ -154,36 +153,27 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             Timer::after_millis(50).await;
         }
 
-        info!("Card Type: {}", card_type);
-        self.card_type = Some(card_type);
-
         let mut init = false;
-        for i in 0..100 {
-            if self.card_command(CMD55, 0, &mut buf).await.is_err()
+        for _ in 0..20 {
+            if self.card_command(CMD55, 0, &mut buf).await.is_ok()
                 // idle
-                || buf[2] != 0x01
+                && buf[2] == 0x01
             {
-                continue;
-            }
-
-            if self.card_command(ACMD41, arg, &mut buf).await.is_ok()
+                if self.card_command(ACMD41, arg, &mut buf).await.is_ok()
                 && buf[0] == 0x40 // not busy
-                && buf[3] == 0x00 // no errors
-                && buf[5] == 0xFF
-            {
-                if buf[1] & 0x40 == 0x40 {
-                    info!("Card is SDHC or SDHC!");
-                }
+                // no errors
+                && buf[3] == 0x00
+                {
+                    if buf[1] & 0x40 == 0x40 {
+                        card_type = CardType::SDHC
+                    }
 
-                // check if card finished init or needs more time
-                if buf[1] & 0x80 == 0x80 {
-                    init = true;
-                    break;
+                    // check if card finished init or needs more time
+                    if buf[1] & 0x80 == 0x80 {
+                        init = true;
+                        break;
+                    }
                 }
-            }
-
-            if i + 1 == 100 {
-                return Err(Error::BadState);
             }
 
             Timer::after_millis(50).await;
@@ -191,6 +181,12 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         if !init {
             return Err(Error::CardNotFound);
         }
+
+        // select card and change state to transfer
+        // self.card_command(0x07, 0, &mut buf).await?;
+
+        info!("Card Type: {}", card_type);
+        self.card_type = Some(card_type);
 
         info!("Success! Card should be initialized");
 
