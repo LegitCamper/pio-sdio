@@ -89,32 +89,35 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         buf[5] = crc7(&buf[0..5]);
         let cmd = self.inner.buf_to_cmd(&buf);
         self.inner.write_command(cmd.0, cmd.1)?;
-        info!("Tx: {:#04X}", buf);
+        info!("TX 0x{:X}: {:#04X}", command, buf);
 
         if !read_buf.is_empty() {
-            let mut response = [0_u32; LONG_CMD_RESP as usize / 32];
+            let mut response = [0_u32; LONG_CMD_RESP.div_ceil(32) as usize];
             let response = &mut response[..read_buf.len().div_ceil(4)];
             read_buf.iter_mut().for_each(|i| *i = 0);
+
+            let timeout = Duration::from_millis(match command {
+                ACMD41 => 1000,
+                _ => 10,
+            });
             self.inner
                 .read_command(
                     response,
-                    read_buf.len() as u8 * 8,
-                    Duration::from_millis(50),
+                    match read_buf.len() {
+                        6 => SHORT_CMD_RESP,
+                        _ => LONG_CMD_RESP,
+                    },
+                    timeout,
                 )
                 .await?;
 
-            read_buf
-                .chunks_mut(4)
-                .zip(response.iter())
-                .for_each(|(read_chunk, resp)| {
-                    let resp = resp.to_le();
-                    read_chunk[0] = (resp >> 24) as u8;
-                    read_chunk[1] = (resp >> 16) as u8;
-                    if read_chunk.len() > 2 {
-                        read_chunk[2] = (resp >> 8) as u8;
-                        read_chunk[3] = resp as u8;
-                    }
-                });
+            // break dma u32 resp into byte array
+            for (chunk, word) in read_buf.chunks_mut(4).zip(response.iter()) {
+                let bytes = word.to_le().to_be_bytes();
+                for (b, dst) in bytes.iter().zip(chunk.iter_mut()) {
+                    *dst = *b;
+                }
+            }
 
             info!("RX: {:#02X}", read_buf);
             info!("RXB: {:08b}", read_buf);
@@ -126,8 +129,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     /// Check the card is initialised.
     pub async fn check_init(&mut self) -> Result<(), Error> {
         if self.card_type.is_none() {
-            // If we don't know what the card type is, try and initialise the
-            // card. This will tell us what type of card it is.
             self.acquire().await
         } else {
             Ok(())
@@ -150,7 +151,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
         for _ in 0..10 {
             if self.card_command(CMD8, 0x1AA, &mut buf).await.is_ok()
-                && buf[0] == 0x8
+                && buf[0] == 0x8 // cmd8 response
+                // correct voltage echo
                 && buf[3] == 0x01
                 && buf[4] == 0xAA
             {
@@ -165,19 +167,18 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         info!("Card Type: {}", card_type);
         self.card_type = Some(card_type);
 
-        // if let Ok(_) = self.card_command(0x05, 0, &mut buf).await {
-        // } else {
-        //     info!("No CMD5 resp");
-        // }
-
+        let mut init = false;
         for i in 0..100 {
-            if self.card_command(CMD55, 0, &mut buf).await.is_err() {
+            if self.card_command(CMD55, 0, &mut buf).await.is_err()
+                // idle
+                || buf[2] != 0x01
+            {
                 continue;
             }
 
             if self.card_command(ACMD41, arg, &mut buf).await.is_ok()
-                && buf[0] == 0x3F
-                && buf[4] == 0x0
+                && buf[0] == 0x40 // not busy
+                && buf[3] == 0x00 // no errors
                 && buf[5] == 0xFF
             {
                 if buf[1] & 0x40 == 0x40 {
@@ -186,6 +187,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
                 // check if card finished init or needs more time
                 if buf[1] & 0x80 == 0x80 {
+                    init = true;
                     break;
                 }
             }
@@ -195,6 +197,9 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             }
 
             Timer::after_millis(50).await;
+        }
+        if !init {
+            return Err(Error::CardNotFound);
         }
 
         info!("Success! Card should be initialized");
@@ -458,8 +463,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 }
 
-/// This is a timer-based object you can use to enforce a timeout
-/// when waiting for SDIO card responses.
 struct Timeout {
     deadline: Instant,
 }
