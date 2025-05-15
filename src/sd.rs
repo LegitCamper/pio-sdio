@@ -26,7 +26,7 @@ pub struct PioSd<
     const SM1: usize,
     const SM2: usize,
 > {
-    pub inner: PioSdInner<'d, PIO, C, SM0, SM1, SM2>,
+    inner: PioSdInner<'d, PIO, C, SM0, SM1, SM2>,
     card_type: Option<CardType>,
 }
 
@@ -260,7 +260,7 @@ impl<'d, PIO: Instance> PioSd1bit<'d, PIO> {
     }
 }
 
-pub struct PioSdInner<
+struct PioSdInner<
     'd,
     PIO: Instance,
     C: Channel,
@@ -283,7 +283,7 @@ pub struct PioSdInner<
 impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM2: usize>
     PioSdInner<'d, PIO, C, SM0, SM1, SM2>
 {
-    pub fn new_1_bit(
+    fn new_1_bit(
         clk_pin: impl PioPin,
         cmd_pin: impl PioPin,
         data_pin: impl PioPin,
@@ -413,10 +413,10 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         Err(Error::WriteError)
     }
 
-    // read response and fills buf
-    //
-    // Returns Error on timeout
-    pub async fn read_command(
+    /// read response and fills buf
+    ///
+    /// Returns Error on timeout
+    async fn read_command(
         &mut self,
         buf: &mut [u8],
         bit_len: u8,
