@@ -96,6 +96,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
             let timeout = Duration::from_millis(match command {
                 ACMD41 => 1000,
+                0x02 => 50,
                 _ => 10,
             });
             self.inner
@@ -118,7 +119,13 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     /// Check the card is initialised.
     pub async fn check_init(&mut self) -> Result<(), Error> {
         if self.card_type.is_none() {
-            self.acquire().await
+            // retry
+            for _ in 0..5 {
+                if self.acquire().await.is_ok() {
+                    return Ok(());
+                }
+            }
+            Err(Error::CardNotFound)
         } else {
             Ok(())
         }
@@ -154,25 +161,29 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         }
 
         let mut init = false;
-        for _ in 0..20 {
+        for _ in 0..10 {
             if self.card_command(CMD55, 0, &mut buf).await.is_ok()
                 // idle
                 && buf[2] == 0x01
             {
-                if self.card_command(ACMD41, arg, &mut buf).await.is_ok()
-                && buf[0] == 0x40 // not busy
+                match self.card_command(ACMD41, arg, &mut buf).await {
+                    Ok(_) => {
+                        if buf[0] == 0x40 // not busy
                 // no errors
                 && buf[3] == 0x00
-                {
-                    if buf[1] & 0x40 == 0x40 {
-                        card_type = CardType::SDHC
-                    }
+                        {
+                            if buf[1] & 0x40 == 0x40 {
+                                card_type = CardType::SDHC
+                            }
 
-                    // check if card finished init or needs more time
-                    if buf[1] & 0x80 == 0x80 {
-                        init = true;
-                        break;
+                            // check if card finished init or needs more time
+                            if buf[1] & 0x80 == 0x80 {
+                                init = true;
+                                break;
+                            }
+                        }
                     }
+                    Err(_) => return Err(Error::CardNotFound),
                 }
             }
 
@@ -181,9 +192,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         if !init {
             return Err(Error::CardNotFound);
         }
-
-        // select card and change state to transfer
-        // self.card_command(0x07, 0, &mut buf).await?;
 
         info!("Card Type: {}", card_type);
         self.card_type = Some(card_type);
