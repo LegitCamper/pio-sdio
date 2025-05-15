@@ -53,7 +53,6 @@ async fn main(_spawner: Spawner) {
         sm1,
         sm2,
         p.DMA_CH0,
-        AcquireOpts::default(),
     );
 
     unwrap!(sd.check_init().await);

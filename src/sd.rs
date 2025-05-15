@@ -25,7 +25,6 @@ pub struct PioSd<
 > {
     pub inner: PioSdInner<'d, PIO, C, SM0, SM1, SM2>,
     card_type: Option<CardType>,
-    options: AcquireOpts,
 }
 
 impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM2: usize>
@@ -43,10 +42,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         cmd_sm: StateMachine<'d, PIO, SM1>,
         data_sm: StateMachine<'d, PIO, SM2>,
         dma: C,
-        options: AcquireOpts,
     ) -> Self {
         Self {
-            options,
             card_type: None,
             inner: PioSdInner::new_1_bit(
                 clk_pin,
@@ -96,7 +93,11 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             let response = &mut response[..(read_buf.len() + 3) / 4];
             read_buf.iter_mut().for_each(|i| *i = 0);
             self.inner
-                .read_command(response, read_buf.len() as u8 * 8)
+                .read_command(
+                    response,
+                    read_buf.len() as u8 * 8,
+                    Duration::from_millis(50),
+                )
                 .await?;
 
             read_buf
@@ -241,6 +242,7 @@ impl<'d, PIO: Instance> PioSd1bit<'d, PIO> {
 
         let read = pio_asm!(
             "out x, 16",
+            "in null, 1",
             "set pindirs, 0",
             "wait 1 pin, 0", // wait until card takes ownership
             "wait 0 pin, 0",
@@ -400,7 +402,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
         self.cmd_sm.set_enable(true);
 
-        let timeout = Delay::new_command();
+        let timeout = Delay::new(Duration::from_millis(2));
         while timeout.check().is_ok() {
             // ensure words were written and sm is stalled
             if self.cmd_sm.tx().empty() && self.cmd_sm.tx().stalled() {
@@ -412,7 +414,12 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     // uses dma to fill buf with read words
-    pub async fn read_command(&mut self, buf: &mut [u32], bit_len: u8) -> Result<(), Error> {
+    pub async fn read_command(
+        &mut self,
+        buf: &mut [u32],
+        bit_len: u8,
+        timeout: Duration,
+    ) -> Result<(), Error> {
         self.cmd_sm.set_config(&self.cmd_read_cfg);
 
         // creates an exec instruction to flush bits left in isr
@@ -422,31 +429,24 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 bit_count: 32 - (bit_len % 32),
             },
             delay: 0,
-
             side_set: None,
         };
-        let counter = (buf.len() as u32 * 32) - 1;
-        // ignore exec instruction by leaving lower bits empty
+        let counter = (buf.len() as u32 * 32) - 2;
         self.cmd_sm
             .tx()
             .push(counter << 16 | null_instr.encode(SideSet::default()) as u32);
 
         with_timeout(
-            Duration::from_millis(50),
+            timeout,
             self.cmd_sm.rx().dma_pull(self.dma.reborrow(), buf, false),
         )
         .await
-        .map_err(|_| Error::ReadError)?;
+        .map_err(|_| {
+            self.reset_command();
+            Error::ReadError
+        })?;
 
-        // prepends start bit to account for pio
-        let mut carry = 0u32;
-        for word in buf.iter_mut() {
-            let new_carry = *word & 1;
-            *word = (*word >> 1) | (carry << 31);
-            carry = new_carry;
-        }
-
-        // take ownership of cmd
+        // take ownership of cmd again
         self.cmd_sm.set_config(&self.cmd_write_cfg);
 
         Ok(())
