@@ -92,8 +92,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         info!("TX 0x{:X}: {:#04X}", command, buf);
 
         if !read_buf.is_empty() {
-            let mut response = [0_u32; LONG_CMD_RESP.div_ceil(32) as usize];
-            let response = &mut response[..read_buf.len().div_ceil(4)];
             read_buf.iter_mut().for_each(|i| *i = 0);
 
             let timeout = Duration::from_millis(match command {
@@ -102,7 +100,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             });
             self.inner
                 .read_command(
-                    response,
+                    read_buf,
                     match read_buf.len() {
                         6 => SHORT_CMD_RESP,
                         _ => LONG_CMD_RESP,
@@ -110,14 +108,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                     timeout,
                 )
                 .await?;
-
-            // break dma u32 resp into byte array
-            for (chunk, word) in read_buf.chunks_mut(4).zip(response.iter()) {
-                let bytes = word.to_le().to_be_bytes();
-                for (b, dst) in bytes.iter().zip(chunk.iter_mut()) {
-                    *dst = *b;
-                }
-            }
 
             info!("RX: {:#02X}", read_buf);
             info!("RXB: {:08b}", read_buf);
@@ -426,11 +416,14 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     // uses dma to fill buf with read words
     pub async fn read_command(
         &mut self,
-        buf: &mut [u32],
+        buf: &mut [u8],
         bit_len: u8,
         timeout: Duration,
     ) -> Result<(), Error> {
         self.cmd_sm.set_config(&self.cmd_read_cfg);
+
+        let mut response = [0_u32; LONG_CMD_RESP.div_ceil(32) as usize];
+        let response = &mut response[..buf.len().div_ceil(4)];
 
         // creates an exec instruction to flush bits left in isr
         let null_instr = Instruction {
@@ -448,7 +441,9 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
         with_timeout(
             timeout,
-            self.cmd_sm.rx().dma_pull(self.dma.reborrow(), buf, false),
+            self.cmd_sm
+                .rx()
+                .dma_pull(self.dma.reborrow(), response, false),
         )
         .await
         .map_err(|_| {
@@ -458,6 +453,14 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
         // take ownership of cmd again
         self.cmd_sm.set_config(&self.cmd_write_cfg);
+
+        // break dma u32 resp into byte array
+        for (chunk, word) in buf.chunks_mut(4).zip(response.iter()) {
+            let bytes = word.to_le().to_be_bytes();
+            for (b, dst) in bytes.iter().zip(chunk.iter_mut()) {
+                *dst = *b;
+            }
+        }
 
         Ok(())
     }
