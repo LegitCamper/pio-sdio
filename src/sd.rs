@@ -234,22 +234,22 @@ impl<'d, PIO: Instance> PioSd1bit<'d, PIO> {
             ".wrap_target",
             "out x, 16",
             "wait 0 irq 0", // wait for clk
-            "wlp:",
+            "write_loop:",
             "out pins, 1",
-            "jmp x-- wlp",
+            "jmp x-- write_loop",
             ".wrap",
         );
 
         let read = pio_asm!(
             "out x, 16",
-            "in null, 1",
+            "in null, 1", // preload start bit which is skipped below
             "set pindirs, 0",
             "wait 1 pin, 0", // wait until card takes ownership
-            "wait 0 pin, 0",
-            "wait 0 irq 0", // wait for clk
-            "rlp:",
+            "wait 0 pin, 0", // start bit
+            "wait 0 irq 0",  // wait for clk
+            "read_loop:",
             "in pins, 1",
-            "jmp x-- rlp",
+            "jmp x-- read_loop",
             "out exec, 16", // flush remaining bits in isr
         );
 
