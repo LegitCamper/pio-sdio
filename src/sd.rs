@@ -169,8 +169,11 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 // idle
                 && buf[2] == 0x01
                 {
+                    // otherwise in battery saving mode
+                    let performance = 1 << 28;
+                    let voltage_window = 0x00FF8000;
                     match self
-                        .card_command(ACMD41, arg | 1 << 28 | 0x00FF8000, &mut buf)
+                        .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
                         .await
                     {
                         Ok(_) => {
