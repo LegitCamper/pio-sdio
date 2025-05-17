@@ -148,7 +148,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let mut card_type = CardType::SD1;
         let mut arg = 0;
 
-        for _ in 0..10 {
+        for _ in 0..15 {
             if self.card_command(CMD8, 0x1AA, &mut buf).await.is_ok()
                 // correct voltage echo
                 && buf[3] == 0x01
@@ -161,36 +161,40 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
             Timer::after_millis(50).await;
         }
-        info!("arg: {:X}", arg);
 
         let mut init = false;
-        for _ in 0..10 {
-            if self.card_command(CMD55, 0, &mut buf).await.is_ok()
+        for _ in 0..2 {
+            for _ in 0..10 {
+                if self.card_command(CMD55, 0, &mut buf).await.is_ok()
                 // idle
                 && buf[2] == 0x01
-            {
-                match self.card_command(ACMD41, arg, &mut buf).await {
-                    Ok(_) => {
-                        if buf[0] & 0x01 == 0 // not busy
+                {
+                    match self
+                        .card_command(ACMD41, arg | 1 << 28 | 0x00FF8000, &mut buf)
+                        .await
+                    {
+                        Ok(_) => {
+                            if buf[0] & 0x01 == 0 // not busy
                             // no errors
                             && buf[3] == 0x00
-                        {
-                            if buf[1] & 0x40 == 0x40 {
-                                card_type = CardType::SDHC
-                            }
+                            {
+                                if buf[1] & 0x40 == 0x40 {
+                                    card_type = CardType::SDHC
+                                }
 
-                            // check if card finished init or needs more time
-                            if buf[1] & 0x80 == 0x80 {
-                                init = true;
-                                break;
+                                // check if card finished init or needs more time
+                                if buf[1] & 0x80 == 0x80 {
+                                    init = true;
+                                    break;
+                                }
                             }
                         }
+                        Err(_) => return Err(Error::CardNotFound),
                     }
-                    Err(_) => return Err(Error::CardNotFound),
                 }
-            }
 
-            Timer::after_millis(200).await;
+                Timer::after_millis(200).await;
+            }
         }
         if !init {
             return Err(Error::CardNotFound);
@@ -465,8 +469,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             self.reset_command();
             Error::ReadError
         })?;
-
-        info!("resp: {:X}", response);
 
         // take ownership of cmd again
         self.cmd_sm.set_config(&self.cmd_write_cfg);
