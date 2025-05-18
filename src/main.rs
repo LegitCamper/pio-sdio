@@ -2,7 +2,7 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use defmt::{info, unwrap};
+use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::PIO0;
@@ -52,13 +52,6 @@ async fn main(_spawner: Spawner) {
             break;
         }
         info!("Failed to get card, trying again...");
-        Timer::after_millis(200).await;
-    }
-    info!("Getting CID");
-    loop {
-        if sd.get_cid().await.is_ok() {
-            break;
-        }
         Timer::after_millis(200).await;
     }
 

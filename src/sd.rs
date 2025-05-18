@@ -125,7 +125,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     async fn acquire(&mut self) -> Result<(), Error> {
-        let mut buf = [0xFF; SHORT_CMD_RESP as usize / 8];
+        let mut long_buf = [0xFF; 17];
+        let mut buf = [0xFF; 6];
 
         // Wait initial 74+ clocks high
         self.inner.reset_command();
@@ -197,16 +198,20 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.card_type = Some(card_type);
 
         // give time for card to finish init
-        Timer::after_millis(100).await;
+        Timer::after_millis(250).await;
 
-        Ok(())
-    }
+        self.card_command(0x02, 0, &mut long_buf).await?;
+        info!("CID: {:X}", long_buf);
 
-    pub async fn get_cid(&mut self) -> Result<(), Error> {
-        let mut buf = [0_u8; 17];
-        self.card_command(0x02, 0, &mut buf).await?;
+        self.card_command(0x03, 0, &mut buf).await?;
+        let rca = (buf[1] as u16) << 8 | buf[2] as u16;
+        info!("RCA: {:X}", rca);
 
-        info!("CID: {:X}", buf);
+        Timer::after_millis(1).await;
+
+        self.card_command(CMD9, (rca as u32) << 16, &mut long_buf)
+            .await?;
+        info!("CSD: {:X}", buf);
 
         Ok(())
     }
