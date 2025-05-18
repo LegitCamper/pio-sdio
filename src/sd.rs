@@ -96,7 +96,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
             let timeout = Duration::from_millis(match command {
                 ACMD41 => 1000,
-                0x02 => 100,
                 _ => 10,
             });
             self.inner
@@ -157,36 +156,38 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         }
 
         let mut init = false;
-        for _ in 0..5 {
-            if self.card_command(CMD55, 0, &mut buf).await.is_ok()
+        for _ in 0..2 {
+            for _ in 0..5 {
+                if self.card_command(CMD55, 0, &mut buf).await.is_ok()
                 // idle
                 && buf[2] == 0x01
-            {
-                let performance = 1 << 28; // otherwise in battery saving mode 
-                let voltage_window = 0x00FF8000;
-                if self
-                    .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
-                    .await
-                    .is_ok()
                 {
-                    if buf[0] & 0x01 == 0 // not busy
+                    let performance = 1 << 28; // otherwise in battery saving mode 
+                    let voltage_window = 0x00FF8000;
+                    if self
+                        .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
+                        .await
+                        .is_ok()
+                    {
+                        if buf[0] & 0x01 == 0 // not busy
                             // no errors
                             && buf[3] == 0x00
-                    {
-                        if buf[1] & 0x40 == 0x40 {
-                            card_type = CardType::SDHC
-                        }
+                        {
+                            if buf[1] & 0x40 == 0x40 {
+                                card_type = CardType::SDHC
+                            }
 
-                        // check if card finished init or needs more time
-                        if buf[1] & 0x80 == 0x80 {
-                            init = true;
-                            break;
+                            // check if card finished init or needs more time
+                            if buf[1] & 0x80 == 0x80 {
+                                init = true;
+                                break;
+                            }
                         }
                     }
                 }
-            }
 
-            Timer::after_millis(200).await;
+                Timer::after_millis(200).await;
+            }
         }
         if !init {
             return Err(Error::CardNotFound);
