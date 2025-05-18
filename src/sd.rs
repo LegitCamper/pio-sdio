@@ -1,7 +1,7 @@
 use defmt::{info, trace};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::Channel;
-use embassy_rp::gpio::Pull;
+use embassy_rp::gpio::{Drive, Pull, SlewRate};
 use embassy_rp::pio::program::{Instruction, SideSet, pio_asm};
 use embassy_rp::pio::{
     self, Common, Direction, Instance, LoadedProgram, PioPin, ShiftConfig, ShiftDirection,
@@ -96,7 +96,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
             let timeout = Duration::from_millis(match command {
                 ACMD41 => 1000,
-                0x02 => 10,
+                0x02 => 100,
                 _ => 10,
             });
             self.inner
@@ -119,15 +119,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     /// Check the card is initialised.
     pub async fn check_init(&mut self) -> Result<(), Error> {
         if self.card_type.is_none() {
-            // retry
-            for _ in 0..5 {
-                match self.acquire().await {
-                    Ok(_) => return Ok(()),
-                    Err(Error::ReadError) => return Err(Error::ReadError),
-                    _ => (),
-                }
-            }
-            Err(Error::CardNotFound)
+            self.acquire().await
         } else {
             Ok(())
         }
@@ -148,56 +140,53 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let mut card_type = CardType::SD1;
         let mut arg = 0;
 
-        for _ in 0..15 {
-            if self.card_command(CMD8, 0x1AA, &mut buf).await.is_ok()
+        for i in 0..5 {
+            if self.card_command(CMD8, 0x1AA, &mut buf).await.is_ok() {
                 // correct voltage echo
-                && buf[3] == 0x01
-                && buf[4] == 0xAA
-            {
-                card_type = CardType::SD2;
-                arg = 1 << 30;
-                break;
+                if buf[3] == 0x01 && buf[4] == 0xAA {
+                    card_type = CardType::SD2;
+                    arg = 1 << 30;
+                    break;
+                } else {
+                    if i == 4 {
+                        return Err(Error::BadState);
+                    }
+                }
             }
-
-            Timer::after_millis(50).await;
+            Timer::after_millis(10).await;
         }
 
         let mut init = false;
-        for _ in 0..2 {
-            for _ in 0..10 {
-                if self.card_command(CMD55, 0, &mut buf).await.is_ok()
+        for _ in 0..5 {
+            if self.card_command(CMD55, 0, &mut buf).await.is_ok()
                 // idle
                 && buf[2] == 0x01
+            {
+                let performance = 1 << 28; // otherwise in battery saving mode 
+                let voltage_window = 0x00FF8000;
+                if self
+                    .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
+                    .await
+                    .is_ok()
                 {
-                    // otherwise in battery saving mode
-                    let performance = 1 << 28;
-                    let voltage_window = 0x00FF8000;
-                    match self
-                        .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
-                        .await
-                    {
-                        Ok(_) => {
-                            if buf[0] & 0x01 == 0 // not busy
+                    if buf[0] & 0x01 == 0 // not busy
                             // no errors
                             && buf[3] == 0x00
-                            {
-                                if buf[1] & 0x40 == 0x40 {
-                                    card_type = CardType::SDHC
-                                }
-
-                                // check if card finished init or needs more time
-                                if buf[1] & 0x80 == 0x80 {
-                                    init = true;
-                                    break;
-                                }
-                            }
+                    {
+                        if buf[1] & 0x40 == 0x40 {
+                            card_type = CardType::SDHC
                         }
-                        Err(_) => return Err(Error::CardNotFound),
+
+                        // check if card finished init or needs more time
+                        if buf[1] & 0x80 == 0x80 {
+                            init = true;
+                            break;
+                        }
                     }
                 }
-
-                Timer::after_millis(200).await;
             }
+
+            Timer::after_millis(200).await;
         }
         if !init {
             return Err(Error::CardNotFound);
@@ -206,7 +195,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         info!("Card Type: {}", card_type);
         self.card_type = Some(card_type);
 
-        Timer::after_micros(100).await;
+        // give time for card to finish init
+        Timer::after_millis(100).await;
 
         Ok(())
     }
@@ -319,6 +309,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
         let mut clk = pio.make_pio_pin(clk_pin);
         clk.set_pull(Pull::Down);
+        clk.set_slew_rate(SlewRate::Fast);
+        clk.set_drive_strength(Drive::_8mA);
         let mut cmd = pio.make_pio_pin(cmd_pin);
         cmd.set_pull(Pull::Up);
         let mut data = pio.make_pio_pin(data_pin);

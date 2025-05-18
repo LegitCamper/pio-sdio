@@ -7,6 +7,7 @@ use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
 mod sd;
@@ -45,8 +46,21 @@ async fn main(_spawner: Spawner) {
         p.DMA_CH0,
     );
 
-    unwrap!(sd.check_init().await);
-    unwrap!(sd.get_cid().await);
+    info!("Acquiring Card");
+    loop {
+        if sd.check_init().await.is_ok() {
+            break;
+        }
+        info!("Failed to get card, trying again...");
+        Timer::after_millis(200).await;
+    }
+    info!("Getting CID");
+    loop {
+        if sd.get_cid().await.is_ok() {
+            break;
+        }
+        Timer::after_millis(200).await;
+    }
 
     info!("Done!");
 }
