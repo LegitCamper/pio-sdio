@@ -11,6 +11,7 @@ use embassy_rp::{PeripheralRef, into_ref};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::sdcard::{CardType, Error};
+use embedded_sdmmc::{Block, BlockIdx};
 // use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 
 const INIT_CLK: u32 = 100_000;
@@ -213,6 +214,45 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             .await?;
         info!("CSD: {:X}", buf);
 
+        self.card_command(0x07, (rca as u32) << 16, &mut buf)
+            .await?;
+        if buf[3] == 0x07 {
+            info!("Card is now in Trans state");
+        }
+
+        Ok(())
+    }
+
+    pub async fn read_data(
+        &mut self,
+        blocks: &mut [Block],
+        start_block_idx: BlockIdx,
+    ) -> Result<(), Error> {
+        let start_idx = match self.card_type {
+            Some(CardType::SD1 | CardType::SD2) => start_block_idx.0 * 512,
+            Some(CardType::SDHC) => start_block_idx.0,
+            None => return Err(Error::CardNotFound),
+        };
+
+        if blocks.len() == 1 {
+            // start single block trans
+            self.card_command(CMD17, start_idx, &mut []).await?;
+            // if cmd_resp[0]
+
+            self.inner.read_data(&mut blocks[0]).await?;
+        } else {
+            // start multiblock trans
+            self.card_command(CMD18, start_idx, &mut []).await?;
+            // if cmd_resp[0]
+
+            for block in blocks {
+                self.inner.read_data(block).await?;
+            }
+
+            // stop multiblock trans
+            self.card_command(CMD12, start_idx, &mut []).await?;
+        }
+
         Ok(())
     }
 }
@@ -401,6 +441,60 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.data_sm.clear_fifos();
         self.data_sm.restart();
         self.data_sm.set_config(&self.data_write_cfg);
+    }
+
+    /// writes data block to data pin(s)
+    async fn write_data(&mut self, block: &Block) -> Result<(), Error> {
+        self.data_sm.tx().push((Block::LEN_U32 - 1) << 16 | 0xFF); // keep line held high
+
+        with_timeout(
+            Duration::from_millis(100),
+            self.data_sm
+                .tx()
+                .dma_push(self.dma.reborrow(), &block.contents, false),
+        )
+        .await
+        .map_err(|_| {
+            self.reset_command();
+            Error::WriteError
+        })
+    }
+
+    /// Read data block into provided block
+    async fn read_data(&mut self, block: &mut Block) -> Result<(), Error> {
+        self.data_sm.set_config(&self.data_read_cfg);
+
+        self.data_sm.tx().push((Block::LEN_U32 - 2) << 16);
+
+        let mut response = [0_u32; 16]; // 512 bytes
+
+        with_timeout(
+            Duration::from_millis(100),
+            self.data_sm
+                .rx()
+                .dma_pull(self.dma.reborrow(), &mut response, false),
+        )
+        .await
+        .map_err(|_| {
+            self.reset_command();
+            Error::ReadError
+        })?;
+
+        // take ownership of data again
+        self.data_sm.set_config(&self.data_write_cfg);
+
+        // break dma u32 resp into byte array
+        for (chunk, word) in block.chunks_mut(4).zip(response.iter()) {
+            let bytes = word.to_le().to_be_bytes();
+            for (b, dst) in bytes.iter().zip(chunk.iter_mut()) {
+                *dst = *b;
+            }
+        }
+
+        // take ownership of dat again
+        self.data_sm.set_config(&self.data_write_cfg);
+
+        Ok(())
     }
 
     fn reset_command(&mut self) {
