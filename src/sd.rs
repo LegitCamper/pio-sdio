@@ -201,23 +201,69 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         // give time for card to finish init
         Timer::after_millis(250).await;
 
-        self.card_command(0x02, 0, &mut long_buf).await?;
-        info!("CID: {:X}", long_buf);
+        for i in 0..5 {
+            if self.card_command(0x02, 0, &mut long_buf).await.is_ok() {
+                info!("CID: {:X}", long_buf);
+                break;
+            };
+            if i == 4 {
+                return Err(Error::CardNotFound);
+            }
+            Timer::after_millis(100).await
+        }
 
-        self.card_command(0x03, 0, &mut buf).await?;
-        let rca = (buf[1] as u16) << 8 | buf[2] as u16;
-        info!("RCA: {:X}", rca);
+        let mut rca = 0_u16;
+        for i in 0..5 {
+            if self.card_command(0x03, 0, &mut buf).await.is_ok() {
+                rca = (buf[1] as u16) << 8 | buf[2] as u16;
+                info!("RCA: {:X}", rca);
+                break;
+            }
+            if i == 4 {
+                return Err(Error::CardNotFound);
+            }
+            Timer::after_millis(100).await
+        }
 
         Timer::after_millis(1).await;
 
-        self.card_command(CMD9, (rca as u32) << 16, &mut long_buf)
-            .await?;
-        info!("CSD: {:X}", buf);
+        for i in 0..5 {
+            if self
+                .card_command(CMD9, (rca as u32) << 16, &mut long_buf)
+                .await
+                .is_ok()
+            {
+                info!("CSD: {:X}", buf);
+                break;
+            }
+            if i == 4 {
+                return Err(Error::CardNotFound);
+            }
+            Timer::after_millis(100).await
+        }
 
-        self.card_command(0x07, (rca as u32) << 16, &mut buf)
-            .await?;
-        if buf[3] == 0x07 {
-            info!("Card is now in Trans state");
+        for i in 0..5 {
+            if self
+                .card_command(0x07, (rca as u32) << 16, &mut buf)
+                .await
+                .is_ok()
+            {
+                // Extract the 32-bit status value from the R1 response (last 4 bytes)
+                let status = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+
+                info!("CMD7 Resp: {:X}", status);
+
+                let state = ((status >> 9) & 0xF) as u8;
+                // entered trans state
+                if state == 0x04 {
+                    info!("Card is now in Trans state");
+                    break;
+                }
+            }
+            if i == 4 {
+                return Err(Error::CardNotFound);
+            }
+            Timer::after_millis(100).await
         }
 
         Ok(())
@@ -464,9 +510,21 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     async fn read_data(&mut self, block: &mut Block) -> Result<(), Error> {
         self.data_sm.set_config(&self.data_read_cfg);
 
-        self.data_sm.tx().push((Block::LEN_U32 - 2) << 16);
+        let mut response = [0_u32; 16 + 2]; // 512 bytes
+        let bits = Block::LEN_U32 + 16; // +16 for 2 byte crc
 
-        let mut response = [0_u32; 16]; // 512 bytes
+        // creates an exec instruction to flush bits left in isr
+        let null_instr = Instruction {
+            operands: pio::program::InstructionOperands::IN {
+                source: pio::program::InSource::NULL,
+                bit_count: 32 - (bits as u8 % 32),
+            },
+            delay: 0,
+            side_set: None,
+        };
+        self.data_sm
+            .tx()
+            .push((bits - 2) << 16 | null_instr.encode(SideSet::default()) as u32);
 
         with_timeout(
             Duration::from_millis(100),
