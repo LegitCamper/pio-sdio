@@ -1,4 +1,4 @@
-use defmt::{info, trace};
+use defmt::{Format, info, trace, warn};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::Channel;
 use embassy_rp::gpio::{Drive, Pull, SlewRate};
@@ -9,8 +9,8 @@ use embassy_rp::pio::{
 };
 use embassy_rp::{PeripheralRef, into_ref};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
+use embedded_sdmmc::sdcard::CardType;
 use embedded_sdmmc::sdcard::proto::*;
-use embedded_sdmmc::sdcard::{CardType, Error};
 use embedded_sdmmc::{Block, BlockIdx};
 // use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 
@@ -18,6 +18,33 @@ const INIT_CLK: u32 = 100_000;
 
 const SHORT_CMD_RESP: u8 = 48;
 const LONG_CMD_RESP: u8 = 136;
+
+/// The possible errors this crate can generate.
+#[derive(Debug, Copy, Clone, Format)]
+pub enum Error {
+    /// We got an error from the Pio state machine
+    Transport,
+    /// We didn't get a response when reading data from the card
+    TimeoutReadBuffer,
+    /// We didn't get a response when waiting for the card to not be busy
+    TimeoutWaitNotBusy,
+    /// We didn't get a response when executing this command
+    TimeoutCommand(u8),
+    /// We got a bad response from Command 58
+    Cmd58Error,
+    /// We failed to read the Card Specific Data register
+    RegisterReadError,
+    /// We got a CRC mismatch (card gave us, we calculated)
+    CrcError(u16, u16),
+    /// Error reading from the card
+    ReadError,
+    /// Error writing to the card
+    WriteError,
+    /// Can't perform this operation with the card in this state
+    BadState,
+    /// Couldn't find the card
+    CardNotFound,
+}
 
 pub struct PioSd<
     'd,
@@ -108,12 +135,18 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                     },
                     timeout,
                 )
-                .await?;
+                .await
+                .map_err(|_| Error::TimeoutCommand(command))?;
 
             info!("RX: {:#02X}", read_buf);
         }
 
         Ok(())
+    }
+
+    /// Reset the card but does not reinitialize
+    pub fn reset(&mut self) {
+        self.card_type = None;
     }
 
     /// Check the card is initialised.
@@ -126,7 +159,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     async fn acquire(&mut self) -> Result<(), Error> {
-        let mut long_buf = [0xFF; 17];
         let mut buf = [0xFF; 6];
 
         // Wait initial 74+ clocks high
@@ -157,61 +189,64 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             Timer::after_millis(10).await;
         }
 
+        let performance = 1 << 28; // otherwise in battery saving mode 
+        let voltage_window = 0x00FF8000;
+
         let mut init = false;
-        for _ in 0..2 {
-            for _ in 0..5 {
-                if self.card_command(CMD55, 0, &mut buf).await.is_ok()
+        for _ in 0..10 {
+            if self.card_command(CMD55, 0, &mut buf).await.is_ok()
                 // idle
                 && buf[2] == 0x01
+            {
+                if self
+                    .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
+                    .await
+                    .is_ok()
                 {
-                    let performance = 1 << 28; // otherwise in battery saving mode 
-                    let voltage_window = 0x00FF8000;
-                    if self
-                        .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
-                        .await
-                        .is_ok()
-                    {
-                        if buf[0] & 0x01 == 0 // not busy
-                            // no errors
-                            && buf[3] == 0x00
-                        {
-                            if buf[1] & 0x40 == 0x40 {
-                                card_type = CardType::SDHC
-                            }
+                    let busy = (buf[2] >> 7) & 1 == 0;
+                    let error = buf[3] != 0;
 
-                            // check if card finished init or needs more time
-                            if buf[1] & 0x80 == 0x80 {
-                                init = true;
-                                break;
-                            }
+                    if !busy && !error {
+                        if buf[1] & 0x40 == 0x40 {
+                            card_type = CardType::SDHC
                         }
+
+                        init = true;
+                        break;
                     }
                 }
 
                 Timer::after_millis(200).await;
             }
         }
-        if !init {
-            return Err(Error::CardNotFound);
+
+        if init {
+            info!("Card Type: {}", card_type);
+            self.card_type = Some(card_type);
+
+            return Ok(());
         }
 
-        info!("Card Type: {}", card_type);
-        self.card_type = Some(card_type);
+        Err(Error::CardNotFound)
+    }
 
-        // give time for card to finish init
-        Timer::after_millis(250).await;
+    pub async fn enter_trans(&mut self) -> Result<(), Error> {
+        let mut long_buf = [0xFF; 17];
+        let mut buf = [0xFF; 6];
 
+        // Get CID
         for i in 0..5 {
             if self.card_command(0x02, 0, &mut long_buf).await.is_ok() {
                 info!("CID: {:X}", long_buf);
                 break;
             };
             if i == 4 {
-                return Err(Error::CardNotFound);
+                return Err(Error::RegisterReadError);
             }
             Timer::after_millis(100).await
         }
 
+        // Get RCA
         let mut rca = 0_u16;
         for i in 0..5 {
             if self.card_command(0x03, 0, &mut buf).await.is_ok() {
@@ -220,13 +255,14 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 break;
             }
             if i == 4 {
-                return Err(Error::CardNotFound);
+                return Err(Error::RegisterReadError);
             }
             Timer::after_millis(100).await
         }
 
         Timer::after_millis(1).await;
 
+        // Get CSD
         for i in 0..5 {
             if self
                 .card_command(CMD9, (rca as u32) << 16, &mut long_buf)
@@ -237,31 +273,37 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                 break;
             }
             if i == 4 {
-                return Err(Error::CardNotFound);
+                return Err(Error::RegisterReadError);
             }
             Timer::after_millis(100).await
         }
 
+        /// Mask for CURRENT_STATE (bits 12:9)
+        const CURRENT_STATE_MASK: u32 = 0b1111 << 9;
+        const TRAN_STATE: u32 = 0b0100 << 9;
+
+        /// Mask for error bits (0–7)
+        const ERROR_BITS_MASK: u32 = 0xFF;
+
+        // Enter TRANSfer mode
         for i in 0..5 {
             if self
                 .card_command(0x07, (rca as u32) << 16, &mut buf)
                 .await
                 .is_ok()
             {
-                // Extract the 32-bit status value from the R1 response (last 4 bytes)
                 let status = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
 
-                info!("CMD7 Resp: {:X}", status);
+                info!("Status {:#010X}", status);
 
-                let state = ((status >> 9) & 0xF) as u8;
                 // entered trans state
-                if state == 0x04 {
+                if (status & CURRENT_STATE_MASK) == TRAN_STATE && (status & ERROR_BITS_MASK) == 0 {
                     info!("Card is now in Trans state");
                     break;
                 }
             }
             if i == 4 {
-                return Err(Error::CardNotFound);
+                return Err(Error::BadState);
             }
             Timer::after_millis(100).await
         }
@@ -535,7 +577,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         .await
         .map_err(|_| {
             self.reset_command();
-            Error::ReadError
+            Error::TimeoutReadBuffer
         })?;
 
         // take ownership of data again
@@ -620,7 +662,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         .await
         .map_err(|_| {
             self.reset_command();
-            Error::ReadError
+            Error::Transport
         })?;
 
         // take ownership of cmd again

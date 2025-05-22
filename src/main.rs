@@ -2,7 +2,7 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use defmt::{info, unwrap};
+use defmt::{info, unwrap, warn};
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::peripherals::PIO0;
@@ -12,7 +12,7 @@ use embedded_sdmmc::Block;
 use {defmt_rtt as _, panic_probe as _};
 
 mod sd;
-use sd::{PioSd, PioSd1bit, PioSdClk};
+use sd::{Error, PioSd, PioSd1bit, PioSdClk};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -48,13 +48,22 @@ async fn main(_spawner: Spawner) {
     );
 
     info!("Acquiring Card");
-    loop {
-        match sd.check_init().await {
-            Ok(_) => break,
-            Err(_) => {
-                info!("Failed to get card, trying again...");
-                Timer::after_millis(200).await;
+    'outer: loop {
+        if sd.check_init().await.is_ok() {
+            loop {
+                match sd.enter_trans().await {
+                    Ok(_) => break 'outer,
+                    // Repeat init seq again
+                    Err(_) => {
+                        sd.reset();
+                        warn!("Failed to enter transfer mode, Trying init again...");
+                        break;
+                    }
+                }
             }
+        } else {
+            warn!("Failed to get card, trying again...");
+            Timer::after_millis(200).await;
         }
     }
 
