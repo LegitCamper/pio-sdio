@@ -50,6 +50,14 @@ async fn main(_spawner: Spawner) {
     info!("Acquiring Card");
     'outer: loop {
         if sd.check_init().await.is_ok() {
+            let csd = sd.read_csd().await.unwrap();
+            match csd {
+                embedded_sdmmc::sdcard::proto::Csd::V1(csd_v1) => (),
+                embedded_sdmmc::sdcard::proto::Csd::V2(csd_v2) => {
+                    info!("SIZE: {:?}", csd_v2.device_size());
+                }
+            }
+
             loop {
                 match sd.enter_trans().await {
                     Ok(_) => break 'outer,

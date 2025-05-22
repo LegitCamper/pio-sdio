@@ -56,6 +56,7 @@ pub struct PioSd<
 > {
     inner: PioSdInner<'d, PIO, C, SM0, SM1, SM2>,
     card_type: Option<CardType>,
+    rca: Option<u16>,
 }
 
 impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM2: usize>
@@ -75,6 +76,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         dma: C,
     ) -> Self {
         Self {
+            rca: None,
             card_type: None,
             inner: PioSdInner::new_1_bit(
                 clk_pin,
@@ -159,6 +161,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     async fn acquire(&mut self) -> Result<(), Error> {
+        let mut long_buf = [0xFF; 17];
         let mut buf = [0xFF; 6];
 
         // Wait initial 74+ clocks high
@@ -192,7 +195,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let performance = 1 << 28; // otherwise in battery saving mode 
         let voltage_window = 0x00FF8000;
 
-        let mut init = false;
+        let mut mem_init = false;
         for _ in 0..2 {
             for _ in 0..10 {
                 if self.card_command(CMD55, 0, &mut buf).await.is_ok()
@@ -212,7 +215,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                                 card_type = CardType::SDHC
                             }
 
-                            init = true;
+                            mem_init = true;
                             break;
                         }
                     }
@@ -222,9 +225,40 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             }
         }
 
-        if init {
+        if mem_init {
+            Timer::after_millis(200).await;
+
+            // Get CID
+            for i in 0..5 {
+                if self.card_command(0x02, 0, &mut long_buf).await.is_ok() {
+                    info!("CID: {:X}", long_buf);
+                    break;
+                };
+                if i == 4 {
+                    return Err(Error::RegisterReadError);
+                }
+                Timer::after_millis(100).await
+            }
+
+            // Get RCA
+            let mut rca = 0_u16;
+            for i in 0..5 {
+                if self.card_command(0x03, 0, &mut buf).await.is_ok() {
+                    rca = (buf[1] as u16) << 8 | buf[2] as u16;
+                    info!("RCA: {:X}", rca);
+                    break;
+                }
+                if i == 4 {
+                    return Err(Error::RegisterReadError);
+                }
+                Timer::after_millis(100).await
+            }
+
+            Timer::after_millis(1).await;
+
             info!("Card Type: {}", card_type);
             self.card_type = Some(card_type);
+            self.rca = Some(rca);
 
             return Ok(());
         }
@@ -232,53 +266,45 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         Err(Error::CardNotFound)
     }
 
-    pub async fn enter_trans(&mut self) -> Result<(), Error> {
+    /// Read the 'card specific data' block.
+    pub async fn read_csd(&mut self) -> Result<Csd, Error> {
         let mut long_buf = [0xFF; 17];
-        let mut buf = [0xFF; 6];
 
-        // Get CID
-        for i in 0..5 {
-            if self.card_command(0x02, 0, &mut long_buf).await.is_ok() {
-                info!("CID: {:X}", long_buf);
-                break;
-            };
-            if i == 4 {
-                return Err(Error::RegisterReadError);
-            }
-            Timer::after_millis(100).await
-        }
-
-        // Get RCA
-        let mut rca = 0_u16;
-        for i in 0..5 {
-            if self.card_command(0x03, 0, &mut buf).await.is_ok() {
-                rca = (buf[1] as u16) << 8 | buf[2] as u16;
-                info!("RCA: {:X}", rca);
-                break;
-            }
-            if i == 4 {
-                return Err(Error::RegisterReadError);
-            }
-            Timer::after_millis(100).await
-        }
-
-        Timer::after_millis(1).await;
-
-        // Get CSD
-        for i in 0..5 {
+        for _ in 0..5 {
             if self
-                .card_command(CMD9, (rca as u32) << 16, &mut long_buf)
+                .card_command(CMD9, (self.rca.unwrap() as u32) << 16, &mut long_buf)
                 .await
                 .is_ok()
             {
-                info!("CSD: {:X}", buf);
-                break;
+                return match self.card_type {
+                    Some(CardType::SD1) => {
+                        let mut csd = CsdV1::new();
+                        csd.data
+                            .iter_mut()
+                            .zip(long_buf[1..].iter())
+                            .for_each(|(csd, resp)| *csd = *resp);
+                        Ok(Csd::V1(csd))
+                    }
+                    Some(CardType::SD2 | CardType::SDHC) => {
+                        let mut csd = CsdV2::new();
+                        csd.data
+                            .iter_mut()
+                            .zip(long_buf[1..].iter())
+                            .for_each(|(csd, resp)| *csd = *resp);
+                        Ok(Csd::V2(csd))
+                    }
+                    None => Err(Error::CardNotFound),
+                };
             }
-            if i == 4 {
-                return Err(Error::RegisterReadError);
-            }
+
             Timer::after_millis(100).await
         }
+
+        Err(Error::RegisterReadError)
+    }
+
+    pub async fn enter_trans(&mut self) -> Result<(), Error> {
+        let mut buf = [0xFF; 6];
 
         /// Mask for CURRENT_STATE (bits 12:9)
         const CURRENT_STATE_MASK: u32 = 0b1111 << 9;
@@ -290,7 +316,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         // Enter TRANSfer mode
         for i in 0..5 {
             if self
-                .card_command(0x07, (rca as u32) << 16, &mut buf)
+                .card_command(0x07, (self.rca.unwrap() as u32) << 16, &mut buf)
                 .await
                 .is_ok()
             {
