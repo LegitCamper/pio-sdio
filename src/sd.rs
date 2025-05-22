@@ -193,30 +193,32 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let voltage_window = 0x00FF8000;
 
         let mut init = false;
-        for _ in 0..10 {
-            if self.card_command(CMD55, 0, &mut buf).await.is_ok()
+        for _ in 0..2 {
+            for _ in 0..10 {
+                if self.card_command(CMD55, 0, &mut buf).await.is_ok()
                 // idle
                 && buf[2] == 0x01
-            {
-                if self
-                    .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
-                    .await
-                    .is_ok()
                 {
-                    let busy = (buf[2] >> 7) & 1 == 0;
-                    let error = buf[3] != 0;
+                    if self
+                        .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
+                        .await
+                        .is_ok()
+                    {
+                        let busy = (buf[2] >> 7) & 1 == 0;
+                        let error = buf[3] != 0;
 
-                    if !busy && !error {
-                        if buf[1] & 0x40 == 0x40 {
-                            card_type = CardType::SDHC
+                        if !busy && !error {
+                            if buf[1] & 0x40 == 0x40 {
+                                card_type = CardType::SDHC
+                            }
+
+                            init = true;
+                            break;
                         }
-
-                        init = true;
-                        break;
                     }
-                }
 
-                Timer::after_millis(200).await;
+                    Timer::after_millis(200).await;
+                }
             }
         }
 
