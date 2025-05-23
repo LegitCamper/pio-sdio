@@ -50,8 +50,11 @@ async fn main(_spawner: Spawner) {
     info!("Acquiring Card");
     'outer: loop {
         if sd.check_init().await.is_ok() {
-            let _csd = sd.read_csd().await.unwrap();
-            // sd.set_frequency(400_000);
+            loop {
+                if let Ok(_csd) = sd.read_csd().await {
+                    break;
+                }
+            }
 
             loop {
                 match sd.enter_trans().await {
@@ -69,6 +72,8 @@ async fn main(_spawner: Spawner) {
             Timer::after_millis(200).await;
         }
     }
+
+    // sd.set_frequency(400_000);
 
     let mut block = [Block::new()];
     unwrap!(sd.read_data(&mut block, embedded_sdmmc::BlockIdx(0)).await);

@@ -149,6 +149,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     /// Reset the card but does not reinitialize
     pub fn reset(&mut self) {
         self.set_frequency(INIT_CLK);
+        self.rca = None;
         self.card_type = None;
     }
 
@@ -234,7 +235,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             // Get CID
             for i in 0..5 {
                 if self.card_command(0x02, 0, &mut long_buf).await.is_ok() {
-                    info!("CID: {:X}", long_buf);
+                    info!("CID: {:02X}", long_buf[1..]);
                     break;
                 };
                 if i == 4 {
