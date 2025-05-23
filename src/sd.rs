@@ -148,6 +148,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
     /// Reset the card but does not reinitialize
     pub fn reset(&mut self) {
+        self.set_frequency(INIT_CLK);
         self.card_type = None;
     }
 
@@ -163,8 +164,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     async fn acquire(&mut self) -> Result<(), Error> {
         let mut long_buf = [0xFF; 17];
         let mut buf = [0xFF; 6];
-
-        self.set_frequency(INIT_CLK);
 
         // Wait initial 74+ clocks high
         self.inner.reset_command();
