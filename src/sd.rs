@@ -186,7 +186,9 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
                     break;
                 } else {
                     if i == 4 {
-                        return Err(Error::BadState);
+                        warn!("CMD8 got garbage but is assuming >SDV2");
+                        card_type = CardType::SD2;
+                        arg = 1 << 30;
                     }
                 }
             }
