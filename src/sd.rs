@@ -266,7 +266,6 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
 
         Err(Error::CardNotFound)
     }
-
     /// Read the 'card specific data' block.
     pub async fn read_csd(&mut self) -> Result<Csd, Error> {
         let mut long_buf = [0xFF; 17];
@@ -312,26 +311,24 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     pub async fn enter_trans(&mut self) -> Result<(), Error> {
         let mut buf = [0xFF; 6];
 
-        /// Mask for CURRENT_STATE (bits 12:9)
-        const CURRENT_STATE_MASK: u32 = 0b1111 << 9;
-        const TRAN_STATE: u32 = 0b0100 << 9;
+        const TRAN_STATE: u8 = 0x04;
 
-        /// Mask for error bits (0–7)
-        const ERROR_BITS_MASK: u32 = 0xFF;
-
-        // Enter TRANSfer mode
+        // Enter TRANsfer mode
         for i in 0..5 {
             if self
                 .card_command(0x07, (self.rca.unwrap() as u32) << 16, &mut buf)
                 .await
                 .is_ok()
             {
-                let status = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                // TODO: unlock if locked
+                let _is_locked = (buf[1] & 0b0000_0010) != 0;
+                let error = buf[1] & 0xFF != 0 || buf[2] & 0xFF != 0;
+                let current_state = buf[3] & 0b0000_1111;
 
-                info!("Status {:#010X}", status);
+                info!("Status {:#010X}", current_state);
 
                 // entered trans state
-                if (status & CURRENT_STATE_MASK) == TRAN_STATE && (status & ERROR_BITS_MASK) == 0 {
+                if current_state == TRAN_STATE && !error {
                     info!("Card is now in Trans state");
                     break;
                 }
@@ -561,6 +558,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         self.data_read_cfg.clock_divider = div.into();
 
         self.clk_sm.set_config(&self.clk_cfg);
+        self.clk_sm.restart();
         self.reset_command();
         self.reset_data();
     }

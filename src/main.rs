@@ -12,7 +12,7 @@ use embedded_sdmmc::Block;
 use {defmt_rtt as _, panic_probe as _};
 
 mod sd;
-use sd::{Error, PioSd, PioSd1bit, PioSdClk};
+use sd::{PioSd, PioSd1bit, PioSdClk};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
