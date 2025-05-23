@@ -164,6 +164,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let mut long_buf = [0xFF; 17];
         let mut buf = [0xFF; 6];
 
+        self.set_frequency(INIT_CLK);
+
         // Wait initial 74+ clocks high
         self.inner.reset_command();
         self.inner.reset_data();
@@ -301,6 +303,11 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         }
 
         Err(Error::RegisterReadError)
+    }
+
+    /// Change SD bus frequency
+    pub fn set_frequency(&mut self, freq: u32) {
+        self.inner.set_freq(freq);
     }
 
     pub async fn enter_trans(&mut self) -> Result<(), Error> {
@@ -543,6 +550,20 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             data_read_cfg,
             data_sm,
         }
+    }
+
+    fn set_freq(&mut self, freq: u32) {
+        let div = (clk_sys_freq() / freq) as u16;
+
+        self.clk_cfg.clock_divider = div.into();
+        self.cmd_write_cfg.clock_divider = div.into();
+        self.cmd_read_cfg.clock_divider = div.into();
+        self.data_write_cfg.clock_divider = div.into();
+        self.data_read_cfg.clock_divider = div.into();
+
+        self.clk_sm.set_config(&self.clk_cfg);
+        self.reset_command();
+        self.reset_data();
     }
 
     fn buf_to_cmd(&self, buf: &[u8]) -> (u32, u16) {
