@@ -1,14 +1,15 @@
 use defmt::{Format, info, trace, warn};
 use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::dma::Channel;
-use embassy_rp::gpio::{Drive, Pull, SlewRate};
+use embassy_rp::gpio::{Drive, Level, Pull, SlewRate};
 use embassy_rp::pio::program::{Instruction, SideSet, pio_asm};
 use embassy_rp::pio::{
     self, Common, Direction, Instance, LoadedProgram, PioPin, ShiftConfig, ShiftDirection,
     StateMachine,
 };
-use embassy_rp::{PeripheralRef, into_ref};
+use embassy_rp::{Peripheral, PeripheralRef, into_ref};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
+use embedded_hal::digital::InputPin;
 use embedded_sdmmc::sdcard::CardType;
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::{Block, BlockIdx};
@@ -167,70 +168,71 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let mut buf = [0xFF; 6];
 
         // Wait initial 74+ clocks high
-        self.inner.reset_command();
-        self.inner.reset_data();
-        self.inner.cmd_sm.set_config(&self.inner.cmd_write_cfg);
         Timer::after(Duration::from_hz(INIT_CLK as u64) * 100).await;
 
         trace!("Reset card..");
         self.card_command(CMD0, 0, &mut []).await?;
 
-        let mut card_type = CardType::SD1;
+        let mut card_type = None;
         let mut arg = 0;
 
-        for i in 0..5 {
+        for _ in 0..10 {
             if self.card_command(CMD8, 0x1AA, &mut buf).await.is_ok() {
                 // correct voltage echo
                 if buf[3] == 0x01 && buf[4] == 0xAA {
-                    card_type = CardType::SD2;
+                    card_type = Some(CardType::SD2);
                     arg = 1 << 30;
                     break;
-                } else {
-                    if i == 4 {
-                        warn!("CMD8 got garbage but is assuming >SDV2");
-                        card_type = CardType::SD2;
-                        arg = 1 << 30;
-                    }
+                // card says cmd8 is illegal
+                } else if buf[0] == 0x05 {
+                    card_type = Some(CardType::SD1);
+                    break;
                 }
             }
-            Timer::after_millis(10).await;
+            Timer::after_millis(5).await;
         }
 
-        let performance = 1 << 28; // otherwise in battery saving mode 
-        let voltage_window = 0x00FF8000;
+        if card_type.is_none() {
+            return Err(Error::CardNotFound);
+        }
+        Timer::after_millis(5).await;
+
+        const OCR: u32 = 0xFF0000; // support 2.7v - 3.6v
+        const PERFORMANCE: u32 = 1 << 28;
 
         let mut mem_init = false;
-        for _ in 0..2 {
+
+        for i in 0..2 {
             for _ in 0..10 {
-                if self.card_command(CMD55, 0, &mut buf).await.is_ok()
-                // idle
-                && buf[2] == 0x01
-                {
-                    if self
-                        .card_command(ACMD41, arg | performance | voltage_window, &mut buf)
-                        .await
-                        .is_ok()
-                    {
-                        let busy = (buf[2] >> 7) & 1 == 0;
-                        let error = buf[3] != 0;
+                if self.card_command(CMD55, 0, &mut buf).await.is_ok() {
+                    let idle = buf[3] & 0x1E == 0; // card status field
+                    let ready_for_app = (buf[4] & 0x20) != 0;
+                    if idle && ready_for_app {
+                        // first does inquiry, then init
+                        let argument = if i != 0 {
+                            arg | PERFORMANCE | (OCR << 8)
+                        } else {
+                            arg | PERFORMANCE | (OCR << 8) | (0x8 << 5)
+                        };
+                        if self.card_command(ACMD41, argument, &mut buf).await.is_ok() {
+                            let busy = (buf[2] & 0x80) == 0;
+                            if !busy {
+                                if buf[1] & 0x40 == 0x40 {
+                                    card_type = Some(CardType::SDHC)
+                                }
 
-                        if !busy && !error {
-                            if buf[1] & 0x40 == 0x40 {
-                                card_type = CardType::SDHC
+                                mem_init = true;
+                                break;
                             }
-
-                            mem_init = true;
-                            break;
                         }
+                        Timer::after_millis(200).await;
                     }
-
-                    Timer::after_millis(200).await;
                 }
             }
         }
 
         if mem_init {
-            Timer::after_millis(200).await;
+            Timer::after_millis(100).await;
 
             // Get CID
             for i in 0..5 {
@@ -261,7 +263,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
             Timer::after_millis(1).await;
 
             info!("Card Type: {}", card_type);
-            self.card_type = Some(card_type);
+            self.card_type = card_type;
             self.rca = Some(rca);
 
             return Ok(());
@@ -314,34 +316,14 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     pub async fn enter_trans(&mut self) -> Result<(), Error> {
         let mut buf = [0xFF; 6];
 
-        const TRAN_STATE: u8 = 0x04;
-
         // Enter TRANsfer mode
-        for i in 0..5 {
-            if self
-                .card_command(0x07, (self.rca.unwrap() as u32) << 16, &mut buf)
-                .await
-                .is_ok()
-            {
-                // TODO: unlock if locked
-                let _is_locked = (buf[1] & 0b0000_0010) != 0;
-                let error = buf[1] & 0xFF != 0 || buf[2] & 0xFF != 0;
-                let current_state = buf[3] & 0b0000_1111;
-
-                info!("Status {:#010X}", current_state);
-
-                // entered trans state
-                if current_state == TRAN_STATE && !error {
-                    info!("Card is now in Trans state");
-                    break;
-                }
+        self.card_command(0x07, (self.rca.unwrap() as u32) << 16, &mut buf)
+            .await?;
+        {
+            if buf[3] == 0x07 {
+                info!("Card is now in Trans state");
             }
-            if i == 4 {
-                return Err(Error::BadState);
-            }
-            Timer::after_millis(100).await
         }
-
         Ok(())
     }
 
@@ -441,7 +423,7 @@ struct PioSdInner<
     const SM2: usize,
 > {
     dma: PeripheralRef<'d, C>,
-    clk_irq: pio::Irq<'d, PIO, 0>,
+    _clk_irq: pio::Irq<'d, PIO, 0>,
     clk_cfg: pio::Config<'d, PIO>,
     clk_sm: StateMachine<'d, PIO, SM0>,
     cmd_write_cfg: pio::Config<'d, PIO>,
@@ -469,7 +451,8 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         dma: C,
     ) -> Self {
         into_ref!(dma);
-        let div = (clk_sys_freq() / INIT_CLK) as u16;
+        let clkdiv = (clk_sys_freq() / INIT_CLK) as u16;
+        info!("DIV: {}", clkdiv);
 
         clk_sm.clear_fifos();
         cmd_sm.clear_fifos();
@@ -487,7 +470,7 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         // Clk program config
         let mut clk_cfg = pio::Config::default();
         clk_cfg.use_program(&clk_prg.clk, &[&clk]);
-        clk_cfg.clock_divider = div.into();
+        clk_cfg.clock_divider = clkdiv.into();
 
         let shift_cfg = ShiftConfig {
             threshold: 32,
@@ -500,14 +483,14 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         cmd_write_cfg.use_program(&one_bit_prg.write, &[]);
         cmd_write_cfg.set_set_pins(&[&cmd]);
         cmd_write_cfg.set_out_pins(&[&cmd]);
-        cmd_write_cfg.clock_divider = div.into();
+        cmd_write_cfg.clock_divider = clkdiv.into();
         cmd_write_cfg.shift_out = shift_cfg;
 
         let mut cmd_read_cfg = pio::Config::default();
         cmd_read_cfg.use_program(&one_bit_prg.read, &[]);
         cmd_read_cfg.set_set_pins(&[&cmd]);
         cmd_read_cfg.set_in_pins(&[&cmd]);
-        cmd_read_cfg.clock_divider = div.into();
+        cmd_read_cfg.clock_divider = clkdiv.into();
         cmd_read_cfg.shift_out = shift_cfg;
         cmd_read_cfg.shift_in = shift_cfg;
 
@@ -516,30 +499,38 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         data_write_cfg.use_program(&one_bit_prg.write, &[]);
         data_write_cfg.set_set_pins(&[&data]);
         data_write_cfg.set_out_pins(&[&data]);
-        data_write_cfg.clock_divider = div.into();
+        data_write_cfg.clock_divider = clkdiv.into();
         data_write_cfg.shift_out = shift_cfg;
 
         let mut data_read_cfg = pio::Config::default();
         data_read_cfg.use_program(&one_bit_prg.read, &[]);
         data_read_cfg.set_set_pins(&[&data]);
         data_read_cfg.set_in_pins(&[&data]);
-        data_read_cfg.clock_divider = div.into();
+        data_read_cfg.clock_divider = clkdiv.into();
         data_read_cfg.shift_out = shift_cfg;
         data_read_cfg.shift_in = shift_cfg;
 
-        clk_sm.set_config(&clk_cfg);
+        clk_sm.set_pins(Level::Low, &[&clk]);
         clk_sm.set_pin_dirs(Direction::Out, &[&clk]);
-        clk_sm.set_enable(true);
+        clk_sm.set_config(&clk_cfg);
+
+        // the default program is the tx so the pins are held high
+        cmd_sm.set_config(&cmd_write_cfg);
+        data_sm.set_config(&data_write_cfg);
 
         // start write programs so pins are held high
-        cmd_sm.set_config(&cmd_write_cfg);
-        cmd_sm.set_enable(true);
-        data_sm.set_config(&data_write_cfg);
-        data_sm.set_enable(true);
+        pio.apply_sm_batch(|pio| {
+            pio.set_enable(&mut data_sm, true);
+            pio.set_enable(&mut cmd_sm, true);
+        });
+
+        // wait for sm to set pins high before starting clk
+        while !data_sm.tx().stalled() && !cmd_sm.tx().stalled() {}
+        clk_sm.set_enable(true);
 
         Self {
             dma,
-            clk_irq,
+            _clk_irq: clk_irq,
             clk_cfg,
             clk_sm,
             cmd_write_cfg,
@@ -552,13 +543,13 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
     }
 
     fn set_freq(&mut self, freq: u32) {
-        let div = (clk_sys_freq() / freq) as u16;
+        let clkdiv = (clk_sys_freq() / freq) as u16;
 
-        self.clk_cfg.clock_divider = div.into();
-        self.cmd_write_cfg.clock_divider = div.into();
-        self.cmd_read_cfg.clock_divider = div.into();
-        self.data_write_cfg.clock_divider = div.into();
-        self.data_read_cfg.clock_divider = div.into();
+        self.clk_cfg.clock_divider = clkdiv.into();
+        self.cmd_write_cfg.clock_divider = clkdiv.into();
+        self.cmd_read_cfg.clock_divider = clkdiv.into();
+        self.data_write_cfg.clock_divider = clkdiv.into();
+        self.data_read_cfg.clock_divider = clkdiv.into();
 
         self.clk_sm.set_config(&self.clk_cfg);
         self.clk_sm.restart();

@@ -5,6 +5,7 @@
 use defmt::{info, unwrap, warn};
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::clk_sys_freq;
 use embassy_rp::peripherals::PIO0;
 use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_time::Timer;
@@ -22,6 +23,7 @@ bind_interrupts!(struct Irqs {
 async fn main(_spawner: Spawner) {
     info!("Running");
     let p = embassy_rp::init(Default::default());
+    info!("Sys CLK: {}Hz", clk_sys_freq());
     let Pio {
         mut common,
         sm0,
@@ -46,6 +48,9 @@ async fn main(_spawner: Spawner) {
         sm2,
         p.DMA_CH0,
     );
+
+    unwrap!(sd.check_init().await);
+    loop {}
 
     info!("Acquiring Card");
     'outer: loop {
@@ -76,16 +81,12 @@ async fn main(_spawner: Spawner) {
     // sd.set_frequency(400_000);
 
     let mut block = [Block::new()];
-    unwrap!(sd.read_data(&mut block, embedded_sdmmc::BlockIdx(0)).await);
-    info!("MBR: {:X}", block[0].contents);
-    let mut block = [
-        Block::new(),
-        Block::new(),
-        Block::new(),
-        Block::new(),
-        Block::new(),
-    ];
-    unwrap!(sd.read_data(&mut block, embedded_sdmmc::BlockIdx(1)).await);
+    // unwrap!(sd.read_data(&mut block, embedded_sdmmc::BlockIdx(0)).await);
+    //
+    loop {
+        let _ = sd.check_init().await;
+        sd.reset();
+    }
 
     info!("Done!");
 }
