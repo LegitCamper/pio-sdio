@@ -49,32 +49,33 @@ async fn main(_spawner: Spawner) {
         p.DMA_CH0,
     );
 
-    unwrap!(sd.check_init().await);
-    loop {}
-
     info!("Acquiring Card");
     'outer: loop {
-        if sd.check_init().await.is_ok() {
-            loop {
-                if let Ok(_csd) = sd.read_csd().await {
-                    break;
-                }
-            }
-
-            loop {
-                match sd.enter_trans().await {
-                    Ok(_) => break 'outer,
-                    // Repeat init seq again
-                    Err(_) => {
-                        sd.reset();
-                        warn!("Failed to enter transfer mode, Trying init again...");
+        match sd.check_init().await {
+            Ok(_) => {
+                loop {
+                    if let Ok(_csd) = sd.read_csd().await {
                         break;
                     }
                 }
+
+                loop {
+                    match sd.enter_trans().await {
+                        Ok(_) => break 'outer,
+                        // Repeat init seq again
+                        Err(_) => {
+                            sd.reset();
+                            warn!("Failed to enter transfer mode, Trying init again...");
+                            break;
+                        }
+                    }
+                }
             }
-        } else {
-            warn!("Failed to get card, trying again...");
-            Timer::after_millis(200).await;
+            Err(sd::Error::BadState) => panic!("Bad state"),
+            Err(_) => {
+                warn!("Failed to Get Card... Trying again");
+                Timer::after_millis(500).await;
+            }
         }
     }
 

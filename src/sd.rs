@@ -176,20 +176,15 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         let mut card_type = None;
         let mut arg = 0;
 
-        for _ in 0..10 {
-            if self.card_command(CMD8, 0x1AA, &mut buf).await.is_ok() {
-                // correct voltage echo
-                if buf[3] == 0x01 && buf[4] == 0xAA {
-                    card_type = Some(CardType::SD2);
-                    arg = 1 << 30;
-                    break;
-                // card says cmd8 is illegal
-                } else if buf[0] == 0x05 {
-                    card_type = Some(CardType::SD1);
-                    break;
-                }
+        if self.card_command(CMD8, 0x1AA, &mut buf).await.is_ok() {
+            // correct voltage echo
+            if buf[3] == 0x01 && buf[4] == 0xAA {
+                card_type = Some(CardType::SD2);
+                arg = 1 << 30;
+            // card says cmd8 is illegal
+            } else if buf[0] == 0x05 {
+                card_type = Some(CardType::SD1);
             }
-            Timer::after_millis(5).await;
         }
 
         if card_type.is_none() {
@@ -200,77 +195,109 @@ impl<'d, PIO: Instance, C: Channel, const SM0: usize, const SM1: usize, const SM
         const OCR: u32 = 0xFF0000; // support 2.7v - 3.6v
         const PERFORMANCE: u32 = 1 << 28;
 
-        let mut mem_init = false;
+        // // first send ocr inquiry
+        // let mut got_inquiry = false;
+        // for _ in 0..5 {
+        //     self.acmd41(&mut buf, arg | PERFORMANCE | (OCR << 8))
+        //         .await?;
+        //     let busy = (buf[2] & 0x80) == 0;
+        //     if !busy {
+        //         if buf[1] & 0x40 == 0x40 {
+        //             card_type = Some(CardType::SDHC)
+        //         }
+        //         got_inquiry = true;
+        //     }
+        //     Timer::after_millis(200).await
+        // }
 
-        for i in 0..2 {
-            for _ in 0..10 {
-                if self.card_command(CMD55, 0, &mut buf).await.is_ok() {
-                    let idle = buf[3] & 0x1E == 0; // card status field
-                    let ready_for_app = (buf[4] & 0x20) != 0;
-                    if idle && ready_for_app {
-                        // first does inquiry, then init
-                        let argument = if i != 0 {
-                            arg | PERFORMANCE | (OCR << 8)
-                        } else {
-                            arg | PERFORMANCE | (OCR << 8) | (0x8 << 5)
-                        };
-                        if self.card_command(ACMD41, argument, &mut buf).await.is_ok() {
-                            let busy = (buf[2] & 0x80) == 0;
-                            if !busy {
-                                if buf[1] & 0x40 == 0x40 {
-                                    card_type = Some(CardType::SDHC)
-                                }
+        // if !got_inquiry {
+        //     return Err(Error::BadState);
+        // }
 
-                                mem_init = true;
-                                break;
-                            }
-                        }
-                        Timer::after_millis(200).await;
-                    }
-                }
+        // then send init with ocr
+        let mut init = false;
+        for _ in 0..5 {
+            self.acmd41(&mut buf, arg | PERFORMANCE | (OCR << 8) | (0x8 << 5))
+                .await?;
+            let busy = (buf[2] & 0x80) == 0;
+            if !busy {
+                init = true;
             }
+            Timer::after_millis(200).await
         }
 
-        if mem_init {
-            Timer::after_millis(100).await;
-
-            // Get CID
-            for i in 0..5 {
-                if self.card_command(0x02, 0, &mut long_buf).await.is_ok() {
-                    info!("CID: {:02X}", long_buf[1..]);
-                    break;
-                };
-                if i == 4 {
-                    return Err(Error::RegisterReadError);
-                }
-                Timer::after_millis(100).await
-            }
-
-            // Get RCA
-            let mut rca = 0_u16;
-            for i in 0..5 {
-                if self.card_command(0x03, 0, &mut buf).await.is_ok() {
-                    rca = (buf[1] as u16) << 8 | buf[2] as u16;
-                    info!("RCA: {:X}", rca);
-                    break;
-                }
-                if i == 4 {
-                    return Err(Error::RegisterReadError);
-                }
-                Timer::after_millis(100).await
-            }
-
-            Timer::after_millis(1).await;
-
-            info!("Card Type: {}", card_type);
-            self.card_type = card_type;
-            self.rca = Some(rca);
-
-            return Ok(());
+        if !init {
+            return Err(Error::BadState);
         }
 
-        Err(Error::CardNotFound)
+        Timer::after_millis(100).await;
+
+        // Get CID
+        for i in 0..5 {
+            if self.card_command(0x02, 0, &mut long_buf).await.is_ok() {
+                info!("CID: {:02X}", long_buf[1..]);
+                break;
+            };
+            if i == 4 {
+                return Err(Error::RegisterReadError);
+            }
+            Timer::after_millis(100).await
+        }
+
+        // Get RCA
+        let mut rca = 0_u16;
+        for i in 0..5 {
+            if self.card_command(0x03, 0, &mut buf).await.is_ok() {
+                rca = (buf[1] as u16) << 8 | buf[2] as u16;
+                info!("RCA: {:X}", rca);
+                break;
+            }
+            if i == 4 {
+                return Err(Error::RegisterReadError);
+            }
+            Timer::after_millis(100).await
+        }
+
+        Timer::after_millis(1).await;
+
+        info!("Card Type: {}", card_type);
+        self.card_type = card_type;
+        self.rca = Some(rca);
+
+        Ok(())
     }
+
+    async fn acmd41(&mut self, buf: &mut [u8], acmd_arg: u32) -> Result<(), Error> {
+        // acd41 needs to be in idle status to be ran!
+        for _ in 0..5 {
+            if self.acmd(buf, acmd_arg, 0).await.is_ok() {
+                return Ok(());
+            }
+        }
+        Err(Error::BadState)
+    }
+
+    /// send an application specific command
+    async fn acmd(
+        &mut self,
+        buf: &mut [u8],
+        acmd_arg: u32,
+        expected_status: u8,
+    ) -> Result<(), Error> {
+        for _ in 0..10 {
+            if self.card_command(CMD55, 0, buf).await.is_ok() {
+                let good_status = buf[3] & 0x1E == expected_status; // card status field
+                let ready_for_app = (buf[4] & 0x20) != 0;
+                info!("STATUS: {}, ready? {}", good_status, ready_for_app);
+                if good_status && ready_for_app {
+                    return self.card_command(ACMD41, acmd_arg, buf).await;
+                }
+            }
+            Timer::after_millis(250).await;
+        }
+        Err(Error::ReadError)
+    }
+
     /// Read the 'card specific data' block.
     pub async fn read_csd(&mut self) -> Result<Csd, Error> {
         let mut long_buf = [0xFF; 17];
