@@ -283,7 +283,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
 
         // break dma u32 resp into byte array
         for (chunk, word) in block.chunks_mut(4).zip(response.iter()) {
-            let bytes = word.to_le().to_be_bytes();
+            let bytes = word.to_be_bytes();
             for (b, dst) in bytes.iter().zip(chunk.iter_mut()) {
                 *dst = *b;
             }
@@ -373,7 +373,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
 
         // break dma u32 resp into byte array
         for (chunk, word) in buf.chunks_mut(4).zip(response.iter()) {
-            let bytes = word.to_le().to_be_bytes();
+            let bytes = word.to_be_bytes();
             for (b, dst) in bytes.iter().zip(chunk.iter_mut()) {
                 *dst = *b;
             }
