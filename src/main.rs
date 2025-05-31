@@ -2,7 +2,7 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
 
-use defmt::{info, unwrap, warn};
+use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::clk_sys_freq;

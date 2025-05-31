@@ -1,15 +1,8 @@
-use defmt::{Format, info, trace, warn};
+use defmt::{Format, info, trace};
 use embassy_rp::Peri;
-use embassy_rp::clocks::clk_sys_freq;
-use embassy_rp::dma::{AnyChannel, Channel};
-use embassy_rp::gpio::{Drive, Level, Pull, SlewRate};
-use embassy_rp::pio::program::{Instruction, SideSet, pio_asm};
-use embassy_rp::pio::{
-    self, Common, Direction, Instance, Irq, LoadedProgram, PioPin, ShiftConfig, ShiftDirection,
-    StateMachine,
-};
-use embassy_time::{Duration, Instant, Timer, with_timeout};
-use embedded_hal::digital::InputPin;
+use embassy_rp::dma::Channel;
+use embassy_rp::pio::{Common, Instance, Irq, PioPin, StateMachine};
+use embassy_time::{Duration, Timer};
 use embedded_sdmmc::sdcard::CardType;
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::{Block, BlockIdx};
@@ -104,9 +97,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
             0,
         ];
         buf[5] = crc7(&buf[0..5]);
-        self.bus
-            .write_command(&buf)
-            .map_err(|e| Error::Transport(e))?;
+        self.bus.write_command(&buf).map_err(Error::Transport)?;
         info!("TX 0x{:X}: {:#04X}", command, buf);
 
         if !read_buf.is_empty() {
@@ -360,7 +351,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
             self.bus
                 .read_data(&mut blocks[0].contents)
                 .await
-                .map_err(|e| Error::Transport(e))?;
+                .map_err(Error::Transport)?;
         } else {
             // start multiblock trans
             self.card_command(CMD18, start_idx, &mut []).await?;
@@ -370,7 +361,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
                 self.bus
                     .read_data(&mut block.contents)
                     .await
-                    .map_err(|e| Error::Transport(e))?;
+                    .map_err(Error::Transport)?;
             }
 
             // stop multiblock trans
