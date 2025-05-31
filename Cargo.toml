@@ -3,6 +3,10 @@ name = "pio_sdio"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+defmt = []
+default = ["defmt"]
+
 [dependencies]
 embassy-executor = { version = "0.7", default-features = false, features = [
   "arch-cortex-m",
@@ -38,3 +42,8 @@ embedded-sdmmc = { version = "0.8.1", default-features = false, features = [
 ] }
 embedded-hal-bus = "0.3.0"
 rand = { version = "0.8.5", default-features = false }
+
+[patch.crates-io]
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", rev = "7eaea84fb769f739f884bc0a474b518b65c126e4" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", rev = "7eaea84fb769f739f884bc0a474b518b65c126e4" }
+embassy-rp = { git = "https://github.com/embassy-rs/embassy", rev = "7eaea84fb769f739f884bc0a474b518b65c126e4" }
