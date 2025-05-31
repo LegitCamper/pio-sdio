@@ -209,8 +209,12 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
 
         self.clk_sm.set_config(&self.clk_cfg);
         self.clk_sm.restart();
-        self.reset_command();
-        self.reset_data();
+
+        self.cmd_sm.clear_fifos();
+        self.cmd_sm.restart();
+
+        self.data_sm.clear_fifos();
+        self.data_sm.restart();
     }
 
     fn buf_to_cmd(&self, buf: &[u8]) -> (u32, u16) {
@@ -219,12 +223,6 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
             (buf[0] as u32) << 24 | (buf[1] as u32) << 16 | (buf[2] as u32) << 8 | buf[3] as u32,
             (buf[4] as u16) << 8 | buf[5] as u16,
         )
-    }
-
-    fn reset_data(&mut self) {
-        self.data_sm.clear_fifos();
-        self.data_sm.restart();
-        self.data_sm.set_config(&self.data_write_cfg);
     }
 
     /// writes data block to data pin(s)
@@ -240,7 +238,8 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         )
         .await
         .map_err(|_| {
-            self.reset_command();
+            self.data_sm.clear_fifos();
+            self.data_sm.restart();
             SdioError::DataWriteError
         })
     }
@@ -273,7 +272,8 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         )
         .await
         .map_err(|_| -> SdioError {
-            self.reset_command();
+            self.cmd_sm.clear_fifos();
+            self.cmd_sm.restart();
             SdioError::DataReadError
         })?;
 
@@ -292,12 +292,6 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         self.data_sm.set_config(&self.data_write_cfg);
 
         Ok(())
-    }
-
-    fn reset_command(&mut self) {
-        self.cmd_sm.clear_fifos();
-        self.cmd_sm.restart();
-        self.cmd_sm.set_config(&self.cmd_write_cfg);
     }
 
     /// writes cmd to sm
@@ -354,7 +348,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
             .tx()
             .push(((bit_len - 2) as u32) << 16 | null_instr.encode(SideSet::default()) as u32);
 
-        with_timeout(
+        let res = with_timeout(
             timeout,
             // use dma because long responses are 5 words
             self.cmd_sm
@@ -363,12 +357,14 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         )
         .await
         .map_err(|_| {
-            self.reset_command();
+            self.cmd_sm.clear_fifos();
+            self.cmd_sm.restart();
             SdioError::CmdReadError
-        })?;
+        });
 
         // take ownership of cmd again
         self.cmd_sm.set_config(&self.cmd_write_cfg);
+        res?;
 
         // break dma u32 resp into byte array
         for (chunk, word) in buf.chunks_mut(4).zip(response.iter()) {
