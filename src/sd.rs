@@ -7,7 +7,7 @@ use embedded_sdmmc::sdcard::CardType;
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::{Block, BlockIdx};
 
-use crate::sdio::{PioSd1bit, PioSdClk, PioSdio, SdioError};
+use crate::sdio::{PioSdio, PioSdio1bit, PioSdioClk, SdioError};
 
 const SHORT_CMD_RESP: u8 = 48;
 const LONG_CMD_RESP: u8 = 136;
@@ -48,8 +48,8 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         clk_pin: Peri<'d, impl PioPin>,
         cmd_pin: Peri<'d, impl PioPin>,
         d0_pin: Peri<'d, impl PioPin>,
-        clk_prg: PioSdClk<'d, PIO>,
-        one_bit_prog: PioSd1bit<'d, PIO>,
+        clk_prg: PioSdioClk<'d, PIO>,
+        one_bit_prog: PioSdio1bit<'d, PIO>,
         pio: &mut Common<'d, PIO>,
         clk_irq: Irq<'d, PIO, 0>,
         clk_sm: StateMachine<'d, PIO, SM0>,

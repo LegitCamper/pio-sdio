@@ -11,6 +11,7 @@ use embassy_rp::{
 };
 use embassy_time::{Duration, Instant, with_timeout};
 
+/// Sdio Errors
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone)]
 pub enum SdioError {
@@ -26,11 +27,12 @@ pub enum SdioError {
     WrongCmdLen,
 }
 
-pub struct PioSdClk<'d, PIO: Instance> {
+/// Pio Program for sdio clk
+pub struct PioSdioClk<'d, PIO: Instance> {
     clk: LoadedProgram<'d, PIO>,
 }
 
-impl<'d, PIO: Instance> PioSdClk<'d, PIO> {
+impl<'d, PIO: Instance> PioSdioClk<'d, PIO> {
     pub fn new(common: &mut Common<'d, PIO>) -> Self {
         let clk_prg = pio_asm!(".side_set 1", "irq 0 side 1", "irq clear 0 side 0",);
         let clk = common.load_program(&clk_prg.program);
@@ -38,12 +40,13 @@ impl<'d, PIO: Instance> PioSdClk<'d, PIO> {
     }
 }
 
-pub struct PioSd1bit<'d, PIO: Instance> {
+/// Pio Programs for sdio 1bit
+pub struct PioSdio1bit<'d, PIO: Instance> {
     write: LoadedProgram<'d, PIO>,
     read: LoadedProgram<'d, PIO>,
 }
 
-impl<'d, PIO: Instance> PioSd1bit<'d, PIO> {
+impl<'d, PIO: Instance> PioSdio1bit<'d, PIO> {
     /// Creates a new 1-bit Tx/Rx program
     pub fn new(common: &mut Common<'d, PIO>) -> Self {
         let write = pio_asm!(
@@ -95,12 +98,13 @@ pub struct PioSdio<'d, PIO: Instance, const SM0: usize, const SM1: usize, const 
 impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
     PioSdio<'d, PIO, SM0, SM1, SM2>
 {
+    /// Create a new 1bit sdio bus with 1 card
     pub fn new_1_bit(
         clk_pin: Peri<'d, impl PioPin>,
         cmd_pin: Peri<'d, impl PioPin>,
         data_pin: Peri<'d, impl PioPin>,
-        clk_prg: PioSdClk<'d, PIO>,
-        one_bit_prg: PioSd1bit<'d, PIO>,
+        clk_prg: PioSdioClk<'d, PIO>,
+        one_bit_prg: PioSdio1bit<'d, PIO>,
         pio: &mut Common<'d, PIO>,
         clk_irq: Irq<'d, PIO, 0>,
         mut clk_sm: StateMachine<'d, PIO, SM0>,
@@ -198,6 +202,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         }
     }
 
+    /// Change the sdio bus frequency after initilzing the card
     pub fn set_freq(&mut self, freq: u32) {
         let clkdiv = calculate_pio_clock_divider(freq);
 
@@ -217,15 +222,9 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         self.data_sm.restart();
     }
 
-    fn buf_to_cmd(&self, buf: &[u8]) -> (u32, u16) {
-        assert!(buf.len() == 6);
-        (
-            (buf[0] as u32) << 24 | (buf[1] as u32) << 16 | (buf[2] as u32) << 8 | buf[3] as u32,
-            (buf[4] as u16) << 8 | buf[5] as u16,
-        )
-    }
-
-    /// writes data block to data pin(s)
+    /// writes data block to card
+    ///
+    /// returns `Sdio::DataWriteError` if write fails
     async fn write_data(&mut self, block: &[u8]) -> Result<(), SdioError> {
         // TODO: wont work
         // self.data_sm.tx().push((512 - 1) << 16 | 0xFF); // keep line held high
@@ -244,7 +243,9 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         })
     }
 
-    /// Read data block into provided block
+    /// Read data block into provided block buffer
+    ///
+    /// returns `Sdio::DataReadError` if read fails
     pub async fn read_data(&mut self, block: &mut [u8]) -> Result<(), SdioError> {
         self.data_sm.set_config(&self.data_read_cfg);
 
@@ -294,12 +295,16 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         Ok(())
     }
 
-    /// writes cmd to sm
+    /// writes command to card
+    ///
+    /// returns `SdioError::CmdReadError` if cmd length is not 6
     pub fn write_command(&mut self, cmd: &[u8]) -> Result<(), SdioError> {
         if cmd.len() != 6 {
             return Err(SdioError::WrongCmdLen);
         }
-        let (upper, lower) = self.buf_to_cmd(cmd);
+        let upper =
+            (cmd[0] as u32) << 24 | (cmd[1] as u32) << 16 | (cmd[2] as u32) << 8 | cmd[3] as u32;
+        let lower = (cmd[4] as u16) << 8 | cmd[5] as u16;
 
         self.cmd_sm.set_enable(false);
 
@@ -312,7 +317,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
 
         let timeout = Instant::now()
             .checked_add(Duration::from_millis(2))
-            .ok_or(SdioError::CmdReadError)?;
+            .ok_or(SdioError::CmdWriteError)?;
         while Instant::now() < timeout {
             // ensure words were written and sm is stalled
             if self.cmd_sm.tx().empty() && self.cmd_sm.tx().stalled() {
