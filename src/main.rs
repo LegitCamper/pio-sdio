@@ -15,7 +15,7 @@ use {defmt_rtt as _, panic_probe as _};
 mod sd;
 use sd::PioSd;
 mod sdio;
-use sdio::{PioSdio1bit, PioSdioClk};
+use sdio::{PioSdio, PioSdio1bit, PioSdioClk};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -37,7 +37,7 @@ async fn main(_spawner: Spawner) {
 
     let clk_prg = PioSdioClk::new(&mut common);
     let one_bit_prg = PioSdio1bit::new(&mut common);
-    let mut sd = PioSd::new(
+    let sdio = PioSdio::new_1_bit(
         p.PIN_2,
         p.PIN_3,
         p.PIN_4,
@@ -50,6 +50,7 @@ async fn main(_spawner: Spawner) {
         sm2,
         p.DMA_CH0,
     );
+    let mut sd = PioSd::new(sdio);
 
     info!("Acquiring Card");
     'outer: loop {

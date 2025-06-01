@@ -1,13 +1,11 @@
 use defmt::{Format, info, trace};
-use embassy_rp::Peri;
-use embassy_rp::dma::Channel;
-use embassy_rp::pio::{Common, Instance, Irq, PioPin, StateMachine};
+use embassy_rp::pio::Instance;
 use embassy_time::{Duration, Timer};
 use embedded_sdmmc::sdcard::CardType;
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::{Block, BlockIdx};
 
-use crate::sdio::{PioSdio, PioSdio1bit, PioSdioClk, SdioError};
+use crate::sdio::{PioSdio, SdioError};
 
 const SHORT_CMD_RESP: u8 = 48;
 const LONG_CMD_RESP: u8 = 136;
@@ -44,35 +42,11 @@ pub struct PioSd<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM
 impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
     PioSd<'d, PIO, SM0, SM1, SM2>
 {
-    pub fn new(
-        clk_pin: Peri<'d, impl PioPin>,
-        cmd_pin: Peri<'d, impl PioPin>,
-        d0_pin: Peri<'d, impl PioPin>,
-        clk_prg: PioSdioClk<'d, PIO>,
-        one_bit_prog: PioSdio1bit<'d, PIO>,
-        pio: &mut Common<'d, PIO>,
-        clk_irq: Irq<'d, PIO, 0>,
-        clk_sm: StateMachine<'d, PIO, SM0>,
-        cmd_sm: StateMachine<'d, PIO, SM1>,
-        data_sm: StateMachine<'d, PIO, SM2>,
-        dma: Peri<'d, impl Channel>,
-    ) -> Self {
+    pub fn new(pio_sdio: PioSdio<'d, PIO, SM0, SM1, SM2>) -> Self {
         Self {
             rca: None,
             card_type: None,
-            bus: PioSdio::new_1_bit(
-                clk_pin,
-                cmd_pin,
-                d0_pin,
-                clk_prg,
-                one_bit_prog,
-                pio,
-                clk_irq,
-                clk_sm,
-                cmd_sm,
-                data_sm,
-                dma.into(),
-            ),
+            bus: pio_sdio,
         }
     }
 
@@ -97,8 +71,8 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
             0,
         ];
         buf[5] = crc7(&buf[0..5]);
-        self.bus.write_command(&buf).map_err(Error::Transport)?;
         info!("TX 0x{:X}: {:#04X}", command, buf);
+        self.bus.write_command(&buf).map_err(Error::Transport)?;
 
         if !read_buf.is_empty() {
             read_buf.iter_mut().for_each(|i| *i = 0);

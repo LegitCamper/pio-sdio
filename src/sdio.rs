@@ -1,15 +1,15 @@
 use embassy_rp::{
     Peri,
     dma::{AnyChannel, Channel},
-    gpio::{Drive, Level, Pull, SlewRate},
+    gpio::{AnyPin, Drive, Level, Pull, SlewRate},
     pio::{
-        Common, Config, Direction, Instance, Irq, LoadedProgram, PioPin, ShiftConfig,
-        ShiftDirection, StateMachine,
+        Common, Config, Direction, FifoJoin, Instance, Irq, LoadedProgram, Pin, PioPin,
+        ShiftConfig, ShiftDirection, StateMachine,
         program::{InSource, Instruction, InstructionOperands, SideSet, pio_asm},
     },
     pio_programs::clock_divider::calculate_pio_clock_divider,
 };
-use embassy_time::{Duration, Instant, with_timeout};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 
 /// Sdio Errors
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -34,7 +34,13 @@ pub struct PioSdioClk<'d, PIO: Instance> {
 
 impl<'d, PIO: Instance> PioSdioClk<'d, PIO> {
     pub fn new(common: &mut Common<'d, PIO>) -> Self {
-        let clk_prg = pio_asm!(".side_set 1", "irq 0 side 1", "irq clear 0 side 0",);
+        let clk_prg = pio_asm!(
+            ".side_set 1 opt",
+            "out x, 32",
+            "run_clk:",
+            "nop side 1",
+            "jmp x-- run_clk side 0",
+        );
         let clk = common.load_program(&clk_prg.program);
         Self { clk }
     }
@@ -50,12 +56,12 @@ impl<'d, PIO: Instance> PioSdio1bit<'d, PIO> {
     /// Creates a new 1-bit Tx/Rx program
     pub fn new(common: &mut Common<'d, PIO>) -> Self {
         let write = pio_asm!(
-            // make sure pins are hi when we set output dir ( avoid pin glitch/accidental start bit )
             "set pins, 1",
             "set pindirs, 1",
             ".wrap_target",
             "out x, 16",
-            "wait 0 irq 0", // wait for clk
+            "nop [15]",
+            "wait 0 pin 0", // wait for clk
             "write_loop:",
             "out pins, 1",
             "jmp x-- write_loop",
@@ -64,11 +70,12 @@ impl<'d, PIO: Instance> PioSdio1bit<'d, PIO> {
 
         let read = pio_asm!(
             "out x, 16",
+            "nop [15]",
             "in null, 1", // preload start bit which is skipped below
             "set pindirs, 0",
-            "wait 1 pin, 0", // wait until card takes ownership
-            "wait 0 pin, 0", // start bit
-            "wait 0 irq 0",  // wait for clk
+            "wait 1 pin, 1", // wait until card takes ownership
+            "wait 0 pin, 1", // start bit
+            "wait 0 pin 0",  // wait for clk
             "read_loop:",
             "in pins, 1",
             "jmp x-- read_loop",
@@ -84,7 +91,6 @@ impl<'d, PIO: Instance> PioSdio1bit<'d, PIO> {
 
 pub struct PioSdio<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize> {
     dma: Peri<'d, AnyChannel>,
-    _clk_irq: Irq<'d, PIO, 0>,
     clk_cfg: Config<'d, PIO>,
     clk_sm: StateMachine<'d, PIO, SM0>,
     cmd_write_cfg: Config<'d, PIO>,
@@ -127,28 +133,30 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         let mut data = pio.make_pio_pin(data_pin);
         data.set_pull(Pull::Up);
 
-        // Clk program config
-        let mut clk_cfg = Config::default();
-        clk_cfg.use_program(&clk_prg.clk, &[&clk]);
-        clk_cfg.clock_divider = clkdiv;
-
         let shift_cfg = ShiftConfig {
             threshold: 32,
             direction: ShiftDirection::Left,
             auto_fill: true,
         };
 
+        // Clk program config
+        let mut clk_cfg = Config::default();
+        clk_cfg.use_program(&clk_prg.clk, &[&clk]);
+        clk_cfg.clock_divider = clkdiv;
+        clk_cfg.shift_out = shift_cfg;
+
         // Cmd config
         let mut cmd_write_cfg = Config::default();
         cmd_write_cfg.use_program(&one_bit_prg.write, &[]);
         cmd_write_cfg.set_set_pins(&[&cmd]);
         cmd_write_cfg.set_out_pins(&[&cmd]);
+        cmd_write_cfg.set_in_pins(&[&clk]);
         cmd_write_cfg.clock_divider = clkdiv;
         cmd_write_cfg.shift_out = shift_cfg;
 
         let mut cmd_read_cfg = Config::default();
         cmd_read_cfg.use_program(&one_bit_prg.read, &[]);
-        cmd_read_cfg.set_set_pins(&[&cmd]);
+        cmd_read_cfg.set_set_pins(&[&clk, &cmd]);
         cmd_read_cfg.set_in_pins(&[&cmd]);
         cmd_read_cfg.clock_divider = clkdiv;
         cmd_read_cfg.shift_out = shift_cfg;
@@ -182,15 +190,11 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         pio.apply_sm_batch(|pio| {
             pio.set_enable(&mut data_sm, true);
             pio.set_enable(&mut cmd_sm, true);
+            pio.set_enable(&mut clk_sm, true);
         });
-
-        // wait for sm to set pins high before starting clk
-        while !data_sm.tx().stalled() && !cmd_sm.tx().stalled() {}
-        clk_sm.set_enable(true);
 
         Self {
             dma: dma.into(),
-            _clk_irq: clk_irq,
             clk_cfg,
             clk_sm,
             cmd_write_cfg,
@@ -200,6 +204,15 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
             data_read_cfg,
             data_sm,
         }
+    }
+
+    /// enables the clk sm and sets the x register counter for the number
+    /// of bits expected to be read or written
+    fn run_clk(&mut self, cycles: u32) {
+        self.clk_sm.restart();
+        self.clk_sm.clear_fifos();
+        // spec requires an additional 8 clks before reading or writing
+        self.clk_sm.tx().push(cycles + 8);
     }
 
     /// Change the sdio bus frequency after initilzing the card
@@ -313,6 +326,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         self.cmd_sm.tx().push((48_u32 - 1) << 16 | upper >> 16);
         self.cmd_sm.tx().push(upper << 16 | lower as u32);
 
+        self.run_clk(48);
         self.cmd_sm.set_enable(true);
 
         let timeout = Instant::now()
@@ -356,9 +370,14 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         let res = with_timeout(
             timeout,
             // use dma because long responses are 5 words
-            self.cmd_sm
-                .rx()
-                .dma_pull(self.dma.reborrow(), response, false),
+            async {
+                self.run_clk(4000);
+                let dma = self
+                    .cmd_sm
+                    .rx()
+                    .dma_pull(self.dma.reborrow(), response, false);
+                dma.await
+            },
         )
         .await
         .map_err(|_| {
@@ -366,6 +385,8 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
             self.cmd_sm.restart();
             SdioError::CmdReadError
         });
+
+        self.clk_sm.restart();
 
         // take ownership of cmd again
         self.cmd_sm.set_config(&self.cmd_write_cfg);
