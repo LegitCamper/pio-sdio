@@ -7,7 +7,7 @@ use embedded_sdmmc::sdcard::CardType;
 use embedded_sdmmc::sdcard::proto::*;
 use embedded_sdmmc::{Block, BlockIdx};
 
-use crate::sdio::{PioSdio, PioSdio1bit, PioSdioClk, SdioError};
+use crate::sdio::{PioSdio, PioSdioClk, PioSdioCmd, SdioError};
 
 const SHORT_CMD_RESP: u8 = 48;
 const LONG_CMD_RESP: u8 = 136;
@@ -73,28 +73,19 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
             0,
         ];
         cmd[5] = crc7(&cmd[0..5]);
-        self.bus.write_command(&cmd).map_err(Error::Transport)?;
         info!("TX 0x{:X}: {:#04X}", command, cmd);
 
+        let timeout = Duration::from_millis(match command {
+            CMD0 => 0,
+            ACMD41 => 1000,
+            _ => 100,
+        });
+        self.bus
+            .command(&cmd, read_buf, timeout)
+            .await
+            .map_err(Error::Transport)?;
+
         if !read_buf.is_empty() {
-            read_buf.iter_mut().for_each(|i| *i = 0);
-
-            let timeout = Duration::from_millis(match command {
-                ACMD41 => 1000,
-                _ => 10,
-            });
-            self.bus
-                .read_command(
-                    read_buf,
-                    match read_buf.len() {
-                        6 => SHORT_CMD_RESP,
-                        _ => LONG_CMD_RESP,
-                    },
-                    timeout,
-                )
-                .await
-                .map_err(|_| Error::TimeoutCommand(command))?;
-
             info!("RX: {:#02X}", read_buf);
         }
 

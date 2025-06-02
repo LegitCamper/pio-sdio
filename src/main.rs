@@ -15,7 +15,7 @@ use {defmt_rtt as _, panic_probe as _};
 mod sd;
 use sd::PioSd;
 mod sdio;
-use sdio::{PioSdio, PioSdio1bit, PioSdioClk};
+use sdio::{PioSdio, PioSdio1bitData, PioSdioClk, PioSdioCmd};
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
@@ -36,13 +36,15 @@ async fn main(_spawner: Spawner) {
     } = Pio::new(p.PIO0, Irqs);
 
     let clk_prg = PioSdioClk::new(&mut common);
-    let one_bit_prg = PioSdio1bit::new(&mut common);
+    let cmd_prg = PioSdioCmd::new(&mut common);
+    let data_prg = PioSdio1bitData::new(&mut common);
     let sdio = PioSdio::new_1_bit(
         p.PIN_2,
         p.PIN_3,
         p.PIN_4,
         clk_prg,
-        one_bit_prg,
+        cmd_prg,
+        data_prg,
         &mut common,
         irq0,
         sm0,
