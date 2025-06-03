@@ -146,39 +146,14 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         let clockdiv = calculate_pio_clock_divider(100_000);
 
         clk_sm.clear_fifos();
-        cmd_sm.clear_fifos();
-        data_sm.clear_fifos();
-
         let mut clk = pio.make_pio_pin(clk_pin);
         clk.set_pull(Pull::Down);
         clk.set_slew_rate(SlewRate::Fast);
         clk.set_drive_strength(Drive::_8mA);
-        let mut cmd = pio.make_pio_pin(cmd_pin);
-        cmd.set_pull(Pull::Up);
-        let mut data = pio.make_pio_pin(data_pin);
-        data.set_pull(Pull::Up);
 
-        // Clk program config
         let mut clk_cfg = Config::default();
         clk_cfg.clock_divider = clockdiv;
         clk_cfg.use_program(&clk_prg.clk, &[&clk]);
-
-        let mut cmd_cfg = Config::default();
-        cmd_cfg.clock_divider = clockdiv;
-        cmd_cfg.use_program(&cmd_prg.cmd, &[]);
-        cmd_cfg.set_set_pins(&[&cmd]);
-        cmd_cfg.set_in_pins(&[&cmd]);
-        cmd_cfg.set_out_pins(&[&cmd]);
-        cmd_cfg.shift_in = ShiftConfig {
-            threshold: 32,
-            direction: ShiftDirection::Left,
-            auto_fill: true,
-        };
-        cmd_cfg.shift_out = ShiftConfig {
-            threshold: 16,
-            direction: ShiftDirection::Left,
-            auto_fill: true,
-        };
 
         let shift_cfg = ShiftConfig {
             threshold: 32,
@@ -186,7 +161,27 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
             auto_fill: true,
         };
 
-        // data config
+        cmd_sm.clear_fifos();
+        let mut cmd = pio.make_pio_pin(cmd_pin);
+        cmd.set_pull(Pull::Up);
+
+        let mut cmd_cfg = Config::default();
+        cmd_cfg.clock_divider = clockdiv;
+        cmd_cfg.use_program(&cmd_prg.cmd, &[]);
+        cmd_cfg.set_set_pins(&[&cmd]);
+        cmd_cfg.set_in_pins(&[&cmd]);
+        cmd_cfg.set_out_pins(&[&cmd]);
+        cmd_cfg.shift_in = shift_cfg;
+        cmd_cfg.shift_out = ShiftConfig {
+            threshold: 16,
+            direction: ShiftDirection::Left,
+            auto_fill: true,
+        };
+
+        data_sm.clear_fifos();
+        let mut data = pio.make_pio_pin(data_pin);
+        data.set_pull(Pull::Up);
+
         let mut data_write_cfg = Config::default();
         data_write_cfg.clock_divider = clockdiv;
         data_write_cfg.use_program(&data_prg.write, &[]);
@@ -206,9 +201,8 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         clk_sm.set_pin_dirs(Direction::Out, &[&clk]);
         clk_sm.set_config(&clk_cfg);
 
-        // the default program is the tx so the pins are held high
         cmd_sm.set_config(&cmd_cfg);
-        data_sm.set_config(&data_write_cfg);
+        data_sm.set_config(&data_write_cfg); // the default program is the tx so the pins are held high
 
         // set 48 bit counter for command writes
         unsafe { cmd_sm.set_x(48 - 1) };
