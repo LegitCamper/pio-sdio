@@ -51,7 +51,7 @@ impl<'d, PIO: Instance> PioSdioCmd<'d, PIO> {
             // write
             "set pins, 1",
             "set pindirs, 1",
-            "mov x, y",     // reset y to 48
+            "out x, 16",    // sets the write bit len, stalls waiting for write
             "wait 0 irq 0", // wait for clk
             "write_loop:",
             "out pins, 1",
@@ -204,13 +204,10 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         cmd_sm.set_config(&cmd_cfg);
         // data_sm.set_config(&data_write_cfg); // the default program is the tx so the pins are held high
 
-        // set 48 bit counter for command writes
-        unsafe { cmd_sm.set_x(48 - 1) };
-
         // start write programs so pins are held high
         pio.apply_sm_batch(|pio| {
-            pio.set_enable(&mut data_sm, false);
             pio.set_enable(&mut cmd_sm, true);
+            pio.set_enable(&mut data_sm, false);
             pio.set_enable(&mut clk_sm, true);
         });
 
@@ -238,6 +235,8 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         }
 
         self.cmd_sm.set_enable(false);
+
+        self.cmd_sm.tx().push(48 - 1);
 
         // packs commands into the top 16 for 16bit shift
         for bytes in cmd.chunks(2) {
