@@ -112,7 +112,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         mut data_sm: StateMachine<'d, PIO, SM2>,
         dma: Peri<'d, impl Channel>,
     ) -> Self {
-        let clkdiv = calculate_pio_clock_divider(100_000);
+        let clockdiv = calculate_pio_clock_divider(100_000);
 
         clk_sm.clear_fifos();
         cmd_sm.clear_fifos();
@@ -130,7 +130,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         // Clk program config
         let mut clk_cfg = Config::default();
         clk_cfg.use_program(&clk_prg.clk, &[&clk]);
-        clk_cfg.clock_divider = clkdiv;
+        clk_cfg.clock_divider = clockdiv;
 
         let shift_cfg = ShiftConfig {
             threshold: 32,
@@ -143,14 +143,14 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         cmd_write_cfg.use_program(&one_bit_prg.write, &[]);
         cmd_write_cfg.set_set_pins(&[&cmd]);
         cmd_write_cfg.set_out_pins(&[&cmd]);
-        cmd_write_cfg.clock_divider = clkdiv;
+        cmd_write_cfg.clock_divider = clockdiv;
         cmd_write_cfg.shift_out = shift_cfg;
 
         let mut cmd_read_cfg = Config::default();
         cmd_read_cfg.use_program(&one_bit_prg.read, &[]);
         cmd_read_cfg.set_set_pins(&[&cmd]);
         cmd_read_cfg.set_in_pins(&[&cmd]);
-        cmd_read_cfg.clock_divider = clkdiv;
+        cmd_read_cfg.clock_divider = clockdiv;
         cmd_read_cfg.shift_out = shift_cfg;
         cmd_read_cfg.shift_in = shift_cfg;
 
@@ -159,14 +159,14 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         data_write_cfg.use_program(&one_bit_prg.write, &[]);
         data_write_cfg.set_set_pins(&[&data]);
         data_write_cfg.set_out_pins(&[&data]);
-        data_write_cfg.clock_divider = clkdiv;
+        data_write_cfg.clock_divider = clockdiv;
         data_write_cfg.shift_out = shift_cfg;
 
         let mut data_read_cfg = Config::default();
         data_read_cfg.use_program(&one_bit_prg.read, &[]);
         data_read_cfg.set_set_pins(&[&data]);
         data_read_cfg.set_in_pins(&[&data]);
-        data_read_cfg.clock_divider = clkdiv;
+        data_read_cfg.clock_divider = clockdiv;
         data_read_cfg.shift_out = shift_cfg;
         data_read_cfg.shift_in = shift_cfg;
 
