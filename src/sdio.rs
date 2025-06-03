@@ -208,6 +208,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
 
         // the default program is the tx so the pins are held high
         cmd_sm.set_config(&cmd_cfg);
+        data_sm.set_config(&data_write_cfg);
 
         // set 48 bit counter for command writes
         unsafe { cmd_sm.set_x(48 - 1) };
