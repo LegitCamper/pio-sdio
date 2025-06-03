@@ -101,13 +101,6 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         Ok(())
     }
 
-    /// Reset the card but does not reinitialize
-    pub fn reset(&mut self) {
-        self.set_frequency(100_000);
-        self.rca = None;
-        self.card_type = None;
-    }
-
     /// Check the card is initialised.
     pub async fn check_init(&mut self) -> Result<(), Error> {
         if self.card_type.is_none() {
@@ -289,11 +282,6 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         Err(Error::RegisterReadError)
     }
 
-    /// Change SD bus frequency
-    pub fn set_frequency(&mut self, freq: u32) {
-        self.bus.set_freq(freq);
-    }
-
     pub async fn enter_trans(&mut self) -> Result<(), Error> {
         let mut buf = [0xFF; 6];
 
@@ -305,45 +293,6 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
                 info!("Card is now in Trans state");
             }
         }
-        Ok(())
-    }
-
-    pub async fn read_data(
-        &mut self,
-        blocks: &mut [Block],
-        start_block_idx: BlockIdx,
-    ) -> Result<(), Error> {
-        let start_idx = match self.card_type {
-            Some(CardType::SD1 | CardType::SD2) => start_block_idx.0 * 512,
-            Some(CardType::SDHC) => start_block_idx.0,
-            None => return Err(Error::CardNotFound),
-        };
-
-        if blocks.len() == 1 {
-            // start single block trans
-            self.card_command(CMD17, start_idx, &mut []).await?;
-            // if cmd_resp[0]
-
-            self.bus
-                .read_data(&mut blocks[0].contents)
-                .await
-                .map_err(Error::Transport)?;
-        } else {
-            // start multiblock trans
-            self.card_command(CMD18, start_idx, &mut []).await?;
-            // if cmd_resp[0]
-
-            for block in blocks {
-                self.bus
-                    .read_data(&mut block.contents)
-                    .await
-                    .map_err(Error::Transport)?;
-            }
-
-            // stop multiblock trans
-            self.card_command(CMD12, start_idx, &mut []).await?;
-        }
-
         Ok(())
     }
 }

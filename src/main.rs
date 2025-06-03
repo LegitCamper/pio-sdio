@@ -67,7 +67,6 @@ async fn main(_spawner: Spawner) {
                         Ok(_) => break 'outer,
                         // Repeat init seq again
                         Err(_) => {
-                            sd.reset();
                             warn!("Failed to enter transfer mode, Trying init again...");
                             break;
                         }
@@ -80,16 +79,6 @@ async fn main(_spawner: Spawner) {
                 Timer::after_millis(500).await;
             }
         }
-    }
-
-    // sd.set_frequency(400_000);
-
-    let mut block = [Block::new()];
-    // unwrap!(sd.read_data(&mut block, embedded_sdmmc::BlockIdx(0)).await);
-    //
-    loop {
-        let _ = sd.check_init().await;
-        sd.reset();
     }
 
     info!("Done!");
