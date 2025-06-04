@@ -52,20 +52,20 @@ impl<'d, PIO: Instance> PioSdioCmd<'d, PIO> {
             "set pins, 1",
             "set pindirs, 1",
             "out x, 16",    // sets the write bit len, stalls waiting for write
-            "wait 0 irq 0", // wait for clk
+            "wait 0 irq 0", // sync to clk
             "write_loop:",
             "out pins, 1",
             "jmp x-- write_loop",
             // read
-            "out y, 16",  // configures the read bit length
+            "out x, 32",  // configures the read bit length
             "in null, 1", // preload start bit which is skipped below
             "set pindirs, 0",
             "wait 1 pin, 0", // wait until card takes ownership
             "wait 0 pin, 0", // start bit
-            "wait 0 irq 0",  // wait for clk
+            "wait 0 irq 0",  // sync to clk
             "read_loop:",
             "in pins, 1",
-            "jmp y-- read_loop",
+            "jmp x-- read_loop",
             "push", // fetch remaining bits in the isr
         );
         Self {
@@ -172,11 +172,7 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
         cmd_cfg.set_in_pins(&[&cmd]);
         cmd_cfg.set_out_pins(&[&cmd]);
         cmd_cfg.shift_in = shift_cfg;
-        cmd_cfg.shift_out = ShiftConfig {
-            threshold: 16,
-            direction: ShiftDirection::Left,
-            auto_fill: true,
-        };
+        cmd_cfg.shift_out = shift_cfg;
 
         data_sm.clear_fifos();
         let mut data = pio.make_pio_pin(data_pin);
@@ -236,25 +232,25 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
 
         self.cmd_sm.set_enable(false);
 
-        self.cmd_sm.tx().push(48 - 1);
-
-        // packs commands into the top 16 for 16bit shift
-        for bytes in cmd.chunks(2) {
-            self.cmd_sm
-                .tx()
-                .push((bytes[0] as u32) << 24 | (bytes[1] as u32) << 16);
-        }
-
-        // push the number of bits to read after write
-        if !read_buf.is_empty() {
-            self.cmd_sm.tx().push(read_buf.len() as u32 * 8);
-        }
+        // pack bit counter into top of command
+        self.cmd_sm
+            .tx()
+            .push((48 - 1) << 16 | (cmd[0] as u32) << 8 | cmd[1] as u32);
+        // pack the rest of the command into the following word
+        self.cmd_sm.tx().push(
+            (cmd[2] as u32) << 24 | (cmd[3] as u32) << 16 | (cmd[4] as u32) << 8 | cmd[5] as u32,
+        );
 
         self.cmd_sm.set_enable(true);
+
+        info!("X: {}", unsafe { self.cmd_sm.get_x() });
 
         if !read_buf.is_empty() {
             let mut response = [0_u32; 5];
             let response = &mut response[..read_buf.len().div_ceil(4) - 2];
+
+            // push the number of bits to read after write
+            self.cmd_sm.tx().push((read_buf.len() as u32 * 8) - 2); // +-1 for prepended start bit
 
             with_timeout(
                 read_timeout,
@@ -279,10 +275,9 @@ impl<'d, PIO: Instance, const SM0: usize, const SM1: usize, const SM2: usize>
                     *dst = *b;
                 }
             }
-        } else {
-            // counter underflows if not reading
-            self.cmd_sm.restart();
         }
+
+        self.cmd_sm.restart();
 
         Ok(())
     }
